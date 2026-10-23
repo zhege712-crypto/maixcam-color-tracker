@@ -1,0 +1,17 @@
+{
+  "fps": 30,
+  "version": "v3.0",
+  "lock_ae": false,
+  "lock_awb": false,
+  "mission": true,
+  "ui": true,
+  "thresholds": {
+    "red": [[0, 100, 40, 110, 5, 95]],
+    "green": [[0, 100, -128, -15, -20, 80]],
+    "blue": [[0, 100, -30, 70, -128, -30]]
+  },
+  "grab_point": [128, 128],
+  "drop_point": [128, 128],
+  "grab_w_n": 90,
+  "drop_w_n": 110
+}

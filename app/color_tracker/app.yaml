@@ -1,0 +1,10 @@
+id: color_tracker
+name: Color Tracker
+name[zh]: 颜色物块追踪
+version: 1.0.0
+author: maxican
+icon: app.png
+desc: Track a colored block and report its normalized position over UART1
+desc[zh]: 识别指定颜色的物块，把归一化位置通过 UART1 上报给主控
+files:
+  - main.py

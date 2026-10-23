@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+
+# 编译产物
+*.exe
+*.o
+*.obj
+*.dll
+
+# 现场抓拍 / 临时快照（体积大、随时可重生成）
+captures/
+*.log
+
+# 比赛规则原件（主办方文档，不随仓库分发）
+附件1-*.docx
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.commandcode/
+Thumbs.db
+desktop.ini
+.DS_Store
