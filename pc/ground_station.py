@@ -19,6 +19,7 @@ A19(TX)，就能看到相机现在盯着谁、对准了没有、离动作点还�
     python ground_station.py                 打开界面，手动选串口连接
     python ground_station.py --port COM5     启动即连接
     python ground_station.py --demo          演示模式（不需要任何硬件）
+    python ground_station.py --port loop://  自检串口通路（pyserial 的回环假口）
 
 依赖：
     pip install pyserial        # 只有真实串口需要；演示模式不需要
@@ -134,7 +135,11 @@ class SerialLink:
     def open(self):
         if not HAVE_SERIAL:
             raise RuntimeError("没装 pyserial（pip install pyserial）")
-        self._ser = serial.Serial(self.port, self.baud, timeout=0.05)
+        # 支持 pyserial 的 URL 形式（比如 loop://），方便没有硬件时自检
+        if "://" in self.port:
+            self._ser = serial.serial_for_url(self.port, self.baud, timeout=0.05)
+        else:
+            self._ser = serial.Serial(self.port, self.baud, timeout=0.05)
         time.sleep(0.2)
         self._ser.reset_input_buffer()
         self._alive = True
