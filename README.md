@@ -34,7 +34,8 @@ E:\maxican\
 │   └─ color_tracker\                   应用包（app.yaml + main.py + app.png）
 ├─ pc\
 │   ├─ protocol.py                      协议纯逻辑（组帧/解帧/流式解析，无依赖）
-│   ├─ serial_monitor.py                上位机调试工具（CH340 联调用）
+│   ├─ ground_station.py                **上位机图形界面**（实时画面框/状态/命令/CSV）
+│   ├─ serial_monitor.py                上位机命令行版（CH340 联调用）
 │   ├─ serial_capture.ps1               不依赖 pyserial 的串口抓包（.NET 串口）
 │   ├─ field_test.ps1                   **现场一键工具**（部署/运行/拉图/改配置/重启）
 │   └─ make_ring_test.py                生成环/块标准色图（给 vision_selftest 用）
@@ -220,28 +221,48 @@ ssh -n root@10.171.126.1 "sync ; sleep 1 ; /sbin/reboot -f"
 
 ---
 
-## 4. 上位机联调（接 STM32 之前先验证相机和线）
+## 4. 上位机（接 STM32 之前先验证相机和线）
 
-### 4.1 装依赖
+一根 CH340 接相机的 A19(TX)，电脑上就能看到相机"现在盯着谁、对准了没有"。
+两个版本，**图形界面看现场，命令行版做批量抓包**。
 
-上位机的真实串口模式需要 pyserial（**当前环境没装**）：
+### 4.1 图形界面（推荐）
 
 ```powershell
 pip install pyserial
-# 或
-uv pip install pyserial
+python pc\ground_station.py                 # 打开界面，选串口点连接
+python pc\ground_station.py --port COM5     # 启动即连接
+python pc\ground_station.py --demo          # 演示模式：不接任何硬件
 ```
 
-不想装也能先验证工具本身：
+![上位机](doc/上位机.png)
 
-```powershell
-python pc\serial_monitor.py --simulate --duration 5
-```
+界面分三块：
 
-模拟模式会自己造帧，还会**故意插入噪声字节和一个校验和错误帧**，
-用来证明解析器能重新同步、坏帧计数正确。
+| 区域 | 内容 |
+| --- | --- |
+| 左 | 把归一化坐标还原成画面框，**按颜色上色**，带移动轨迹；无目标时显示"搜索中" |
+| 右·状态 | 状态机阶段 / 颜色 / 序号 / 帧率 / 丢帧 / 坏帧 / **最近回执** |
+| 右·坐标 | x y w h 的 `归一化值 → 画布像素`，以及相对中心的偏差 Δx Δy |
+| 右·控制 | PING / NEXT / ABORT / RUN / SAVE / CAL / 切颜色 / 设帧率 / 录 CSV |
+| 下 | 日志：状态变化、下发命令的十六进制、**相机的 OK / FAIL 回执** |
 
-### 4.2 接 CH340 实测
+几个细节：
+
+- **回执会单独显示。** 相机每收到一条命令都回一帧 `CC CC DD DD`，和数据帧走同一根线。
+  上位机用 `MixedParser` 同时认这两种帧头，所以命令到底成功没有，日志里一眼可见
+  （比如搬运模式下按 CAL 会明确显示 `CALIBRATE FAIL`）。
+- **帧率是把"每秒收到多少帧"算出来的**，能直接看出相机是不是跑不动了。
+- **丢帧按序号推算**，坏帧是校验和/帧尾不对的次数 —— 这两个数一涨就是接线或波特率的问题。
+- **录制 CSV** 存到 `captures\gs-时间.csv`，离线复盘用（Excel 直接打开）。
+- 画面区会跟着窗口缩放，归一化坐标铺满不留白。
+
+`--demo` 模式自己造一整套搬运周期（搜索→对准→可抓→对准目标区→可放→完成），
+没有相机也能把界面和流程跑通，给老师演示很方便。
+
+### 4.2 命令行版
+
+不想开窗口、或者要长时间抓包时用它：
 
 ```powershell
 python pc\serial_monitor.py --list                      # 找串口号
@@ -251,6 +272,15 @@ python pc\serial_monitor.py --port COM5 --color green --repeat
 
 `--repeat` 会每 200ms 重发一次启动命令，直到收到相机第一帧 —— 对应"相机开机十几秒、
 主控早就上电了"的真实场景。
+
+不想接硬件也能先验证工具本身：
+
+```powershell
+python pc\serial_monitor.py --simulate --duration 5
+```
+
+模拟模式会自己造帧，还会**故意插入噪声字节和一个校验和错误帧**，
+用来证明解析器能重新同步、坏帧计数正确。
 
 运行中可以直接敲命令（回车执行）：
 
@@ -406,9 +436,18 @@ python tests\test_protocol.py
 ```
 
 覆盖：三套实现的组帧字节比对、校验和一致、流式解析、归一化换算、
-色块转帧、阈值表合法性、上位机命令映射、模拟模式与相机端换算一致。
+色块转帧、阈值表合法性、上位机命令映射、模拟模式与相机端换算一致、
+**混合流解析（数据帧+回执帧）、上位机画面换算、演示数据源**。
 
-**当前状态**：C 43 项 / Python 162 项断言全部通过。
+**当前状态**：
+
+| 测试 | 断言数 |
+| --- | --- |
+| `tests/test_protocol.py` | 308 |
+| `tests/test_mission.py` | 220 |
+| `tests/test_vision_sim.py` | 44 |
+| `stm32/host_test.c`（gcc） | 43 |
+| **合计** | **615** |
 
 ---
 

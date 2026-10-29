@@ -705,6 +705,93 @@ def test_capture_file_decode():
               "不存在的文件应返回 2")
 
 
+def test_mixed_parser():
+    section("上位机：混合流解析（17 字节数据帧 + 11 字节回执同一根线）")
+    up = P.build_uplink(7, 1, P.COLOR_RED, P.STATE_GRAB, 120, 130, 40, 42)
+    ack = P.build_ack(P.CMD_NEXT, P.STATUS_OK)
+    stream = b"\x00\xAA" + up + ack + up
+
+    # 一次喂进去
+    p = P.MixedParser()
+    out = p.feed(stream)
+    kinds = [f["kind"] for f in out]
+    check(kinds == ["uplink", "downlink", "uplink"],
+          "应解出 数据/回执/数据，得到 %s", kinds)
+    check(p.uplink_count == 2 and p.downlink_count == 1,
+          "计数错误：上行 %d 下行 %d", p.uplink_count, p.downlink_count)
+    check(out[1]["ack_of"] == P.CMD_NEXT, "回执应对应 NEXT，得到 %s",
+          hex(out[1]["ack_of"]))
+    check(out[0]["seq"] == 7, "序号解析错误，得到 %d", out[0]["seq"])
+
+    # 一字节一字节喂（验证拆包/重新同步）
+    p2 = P.MixedParser()
+    out2 = []
+    for i in range(len(stream)):
+        out2 += p2.feed(stream[i:i + 1])
+    check([f["kind"] for f in out2] == kinds, "逐字节喂入结果应一致")
+
+    # 坏帧之后要能重新同步
+    p3 = P.MixedParser()
+    bad = bytearray(up)
+    bad[12] ^= 0xFF
+    out3 = p3.feed(bytes(bad) + up)
+    check(p3.bad_frames == 1, "应记录 1 个坏帧，实际 %d", p3.bad_frames)
+    check(len(out3) == 1 and out3[0]["seq"] == 7,
+          "坏帧之后应重新同步到好帧，得到 %d 帧", len(out3))
+
+    # 纯噪声不能卡死，也不能吐出假帧
+    p4 = P.MixedParser()
+    check(p4.feed(b"\x01" * 40) == [], "纯噪声不该解出帧")
+
+
+def test_ground_station():
+    section("上位机：画面换算 + 演示数据源")
+    GS = load_module("ground_station", os.path.join("pc", "ground_station.py"))
+
+    # 归一化 -> 画布像素。h_n 也是按**画面宽度**归一化的，这条最容易搞错。
+    x, y, w, h = GS.norm_box(128, 128, 51, 51, 640, 480)
+    # 注意 128/255 并不等于 0.5，所以"中心"是 321.25 / 240.94 而不是 320 / 240
+    check(abs((x + w / 2) - 128 / 255.0 * 640) < 0.6,
+          "中心 x 换算错误，得到 %.2f", x + w / 2)
+    check(abs((y + h / 2) - 128 / 255.0 * 480) < 0.6,
+          "中心 y 换算错误，得到 %.2f", y + h / 2)
+    check(abs(w - 128.0) < 0.6, "w_n=51 -> 128px，得到 %.1f", w)
+    check(abs(h - 128.0) < 0.6, "h_n 也应按宽度换算 -> 128px，得到 %.1f", h)
+
+    # 演示脚本要覆盖全部状态、两种有无目标、三种颜色
+    poses = [GS.demo_pose(i * 0.05) for i in range(700)]
+    check(set(p[2] for p in poses) == {0, 1, 2, 3, 4, 5},
+          "演示应覆盖 6 个状态，实际 %s", sorted(set(p[2] for p in poses)))
+    check(set(p[0] for p in poses) == {0, 1}, "演示应同时有「有目标/无目标」")
+    check(len(set(p[1] for p in poses)) == 3, "演示应覆盖三种颜色")
+    check(all(0 <= v <= 255 for p in poses for v in p[3:]),
+          "演示坐标必须落在 0-255 内")
+
+    # 演示造出来的帧必须和相机端字节一致
+    exists, color, state, xn, yn, wn, hn = GS.demo_pose(4.2)
+    code = P.COLOR_VALUES[color]
+    args = (3, 1, code, state, int(round(xn)), int(round(yn)),
+            int(round(wn)), int(round(hn)))
+    check(P.build_uplink(*args) == CAM.build_uplink(*args),
+          "演示帧必须与相机端 build_uplink 字节一致")
+    check(P.parse_uplink(P.build_uplink(*args)) is not None, "演示帧应能被解析")
+
+    # 下发命令要收到回执；搬运模式下 CALIBRATE 必须是 FAIL
+    link = GS.DemoLink()
+    link.open()
+    link.send(P.build_downlink(P.CMD_NEXT, 0))
+    acks = [f for f in link.drain() if f["kind"] == "downlink"]
+    check(len(acks) == 1, "NEXT 应回一条回执，得到 %d", len(acks))
+    if acks:
+        check(acks[0]["ack_of"] == P.CMD_NEXT, "回执应对应 NEXT")
+        check(acks[0]["arg"] == P.STATUS_OK, "NEXT 应成功")
+
+    link.send(P.build_downlink(P.CMD_CALIBRATE, 0))
+    acks = [f for f in link.drain() if f["kind"] == "downlink"]
+    check(bool(acks) and acks[0]["arg"] == P.STATUS_FAIL,
+          "搬运模式下 CALIBRATE 应回 FAIL（与相机端行为一致）")
+
+
 def main():
     print("=" * 64)
     print("协议跨实现一致性测试（基准：协议定稿文档的示例帧）")
@@ -725,6 +812,8 @@ def main():
     test_capture_file_decode()
     test_upper_computer()
     test_sim_frames()
+    test_mixed_parser()
+    test_ground_station()
 
     print("\n" + "=" * 64)
     print("结果：通过 %d 项，失败 %d 项" % (_PASS, _FAIL))

@@ -274,6 +274,63 @@ class DownlinkParser(_StreamParser):
         super().__init__(DOWN_HEADER, DOWN_TAIL, DOWN_FRAME_LEN, parse_downlink, 4, 5)
 
 
+class MixedParser:
+    """上位机侧：同时处理「上行数据帧(AAAA/17B)」和「相机回执帧(CCCC/11B)」。
+
+    为什么需要它：相机每收到一条下行命令都会立刻回一帧 11 字节回执，
+    而回执和 17 字节的数据帧走的是**同一根 TX 线**。只认 AAAA 的
+    UplinkParser 会把这 11 字节当垃圾吞掉（看不到命令到底成功没有），
+    只认 CCCC 的又看不到数据。所以这里按「哪个帧头先出现」分派。
+
+    返回的每个 dict 都带 kind = "uplink" / "downlink"。
+    """
+
+    def __init__(self):
+        self.buf = bytearray()
+        self.bad_frames = 0
+        self.uplink_count = 0
+        self.downlink_count = 0
+
+    def feed(self, data: bytes) -> List[Dict]:
+        out: List[Dict] = []
+        self.buf.extend(data)
+        while True:
+            i_up = self.buf.find(UP_HEADER)
+            i_dn = self.buf.find(DOWN_HEADER)
+
+            if i_up < 0 and i_dn < 0:
+                # 两个头都没有：只保留可能是帧头前缀的尾巴
+                if len(self.buf) > 3:
+                    del self.buf[: len(self.buf) - 3]
+                break
+
+            if i_dn < 0 or (0 <= i_up < i_dn):
+                idx, frame_len, parser, kind = i_up, UP_FRAME_LEN, parse_uplink, "uplink"
+            else:
+                idx, frame_len, parser, kind = i_dn, DOWN_FRAME_LEN, parse_downlink, "downlink"
+
+            if idx > 0:
+                del self.buf[:idx]
+            if len(self.buf) < frame_len:
+                break
+
+            frame = bytes(self.buf[:frame_len])
+            parsed = parser(frame)
+            if parsed is None:
+                self.bad_frames += 1
+                del self.buf[:1]          # 丢掉一个字节重新找帧头
+                continue
+
+            parsed["kind"] = kind
+            if kind == "uplink":
+                self.uplink_count += 1
+            else:
+                self.downlink_count += 1
+            out.append(parsed)
+            del self.buf[:frame_len]
+        return out
+
+
 # ---------------------------------------------------------------- 归一化
 
 def norm255(value: float, total: float) -> int:
@@ -294,11 +351,14 @@ def seq_gap(prev: Optional[int], cur: int) -> int:
 __all__ = [
     "UP_FRAME_LEN", "DOWN_FRAME_LEN", "CENTER_N",
     "COLOR_RED", "COLOR_GREEN", "COLOR_BLUE", "COLOR_NAMES", "COLOR_VALUES",
-    "CMD_SET_COLOR", "CMD_RUN_STANDBY", "CMD_SET_FPS", "CMD_SAVE", "CMD_PING", "CMD_NAMES",
+    "CMD_SET_COLOR", "CMD_RUN_STANDBY", "CMD_SET_FPS", "CMD_CALIBRATE",
+    "CMD_NEXT", "CMD_ABORT", "CMD_SAVE", "CMD_PING", "CMD_NAMES",
+    "STATE_SEARCH", "STATE_MATERIAL", "STATE_GRAB",
+    "STATE_DEST", "STATE_DROP", "STATE_DONE", "STATE_NAMES",
     "STATUS_OK", "STATUS_FAIL",
     "uplink_checksum", "downlink_checksum",
     "build_uplink", "build_downlink", "build_ack",
     "parse_uplink", "parse_downlink",
-    "UplinkParser", "DownlinkParser",
+    "UplinkParser", "DownlinkParser", "MixedParser",
     "norm255", "seq_gap",
 ]
