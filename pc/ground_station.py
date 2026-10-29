@@ -879,13 +879,17 @@ class GroundStation:
         ok = bool(d.get("demo_ok", d["arg"] == P.STATUS_OK))
         name = P.CMD_NAMES.get(d["ack_of"], "0x%02X" % d["ack_of"])
         text = "%s %s" % (name, "OK" if ok else "FAIL")
-        self.last_ack = text
-        self.v_ack.set(text)
         if ok:
             self.ack_ok += 1
-            self.log("<- 回执 %s" % text, "ok")
         else:
             self.ack_fail += 1
+        # 带上累计计数：否则下一条命令一来就把上一条的结果盖掉了
+        self.last_ack = "%s   [OK %d / FAIL %d]" % (
+            text, self.ack_ok, self.ack_fail)
+        self.v_ack.set(self.last_ack)
+        if ok:
+            self.log("<- 回执 %s" % text, "ok")
+        else:
             self.log("<- 回执 %s（相机拒绝了这条命令）" % text, "err")
 
     # ------------------------------------------------------------ 绘制
