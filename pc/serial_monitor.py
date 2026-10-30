@@ -352,7 +352,7 @@ def decode_file(path):
                   "或接到了别的信号；也可能是旧固件还在发 17 字节的 v3 帧）")
         return 1
 
-    print("\n参考：v4 每帧 20 字节，30 帧/秒 ≈ 600 字节/秒")
+    print("\n参考：v4 每帧 20 字节；实测 14~16 帧/秒 ≈ 280~320 字节/秒")
     print("\n" + "=" * 68)
     print("共解析出 %d 帧；无目标 %d；色环 %d；色块 %d；校验/帧尾失败 %d"
           % (stats.total, stats.no_target, stats.rings, stats.blocks,

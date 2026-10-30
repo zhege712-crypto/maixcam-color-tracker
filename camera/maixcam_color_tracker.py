@@ -1020,8 +1020,8 @@ def draw_field_ui(canvas, ui, image, line1, line2, msg, running):
         y   0..52   大号任务码（scale 3 ≈ 48px ≈ 5mm，满足规则"字高≥4mm"）
         y  52..56   分隔线
         y  58..    相机画面 + 目标框
-        y 268..368  10 个按钮（5 列 x 2 行）：
-                    1 2 3 CLR RUN / LEARN SAVE G-SZ D-SZ RST
+        y 268..368  8 个按钮（4 列 x 2 行）：
+                    1 2 3 CLR / RUN LEARN SAVE RST （共 8 个）
     """
     try:
         canvas.draw_string(8, 4, line1, image.COLOR_YELLOW, 3)
@@ -1685,9 +1685,14 @@ def main(argv=None):
                     order2 = parse_task_code(ui.code_buf)
                     if order2:
                         task_code = ui.code_buf
-                        mission = make_mission(order2)
+                        # 任务码现在**只用于屏幕显示**（规则里值 5 分）。
+                        # v4 由主控负责流程，所以这里不能顺手把本地状态机打开
+                        # —— 否则屏幕上会开始显示"对准物料/可放置"，而串口帧
+                        # 里根本没有这些信息，现场会彻底对不上。
+                        if mission is not None:
+                            mission = make_mission(order2)   # 只有 --mission 时才重建
                         say("CODE %s OK" % task_code)
-                        print("[UI] 任务码 -> %s" % task_code)
+                        print("[UI] 任务码 -> %s（仅显示）" % task_code)
                     else:
                         say("BAD CODE")
                 else:
@@ -2002,8 +2007,12 @@ def main(argv=None):
                 line1 = "%s  %s" % (color_name.upper(),
                                     "STANDBY" if standby else "RUN")
                 if info:
-                    line2 = "xn=%d yn=%d wn=%d hn=%d" % (info["x_n"], info["y_n"],
-                                                         info["w_n"], info["h_n"])
+                    # v4：info 里是分析分辨率下的像素值（x/y 是左上角，cx/cy 是中心）。
+                    # 屏幕上只画"中心/尺寸"就够了，别再把归一化的 x_n 捞出来（已经没有这个键）。
+                    line2 = "%s cx=%d cy=%d %dx%d" % (
+                        "RING" if info.get("is_ring") else "BLOCK",
+                        int(info["cx"]), int(info["cy"]),
+                        int(info["w"]), int(info["h"]))
                 else:
                     line2 = "NO TARGET"
 
@@ -2012,7 +2021,7 @@ def main(argv=None):
             if ui is None:
                 img.draw_string(4, 4, line1, image.COLOR_WHITE, 2)
                 img.draw_string(4, 30, line2, image.COLOR_WHITE, 1)
-                img.draw_string(4, 52, "fps=%.1f seq=%d" % (fps_now, seq),
+                img.draw_string(4, 52, "fps=%.1f" % fps_now,
                                 image.COLOR_WHITE, 1)
 
                 # 任务码显示：比赛规则要求"显示任务"（5 分），
@@ -2107,9 +2116,14 @@ def main(argv=None):
                          ",".join(sorted(mission.done)) or "-",
                          rx_bytes, rx_frames))
             elif info:
-                print("[RUN] %.1ffps seq=%d 命中 xn=%d yn=%d wn=%d hn=%d 像素=(%d,%d %dx%d) rx=%dB/%df"
-                      % (fps_now, seq, info["x_n"], info["y_n"], info["w_n"], info["h_n"],
-                         info["x"], info["y"], info["w"], info["h"], rx_bytes, rx_frames))
+                # v4：日志里打的是"分析分辨率下的像素"，协议帧里另外换算成 640x480。
+                print("[RUN] %.1ffps %s cx=%d cy=%d %dx%d (左上角 %d,%d) rx=%dB/%df"
+                      % (fps_now,
+                         "环" if info.get("is_ring") else "块",
+                         int(info["cx"]), int(info["cy"]),
+                         int(info["w"]), int(info["h"]),
+                         int(info["x"]), int(info["y"]),
+                         rx_bytes, rx_frames))
             else:
                 print("[RUN] %.1ffps seq=%d 未检测到目标 rx=%dB/%df"
                       % (fps_now, seq, rx_bytes, rx_frames))

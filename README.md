@@ -2,8 +2,9 @@
 
 智能搬运比赛项目：**相机负责"看"，STM32 负责"动"**。
 
-相机识别目标颜色的物块，把"是否存在 / 颜色 / 中心位置 / 尺寸"按归一化比例打包成串口帧，
-STM32 拿去做"居中 + 抵近"，靠近到可以抓取的位置后下爪。
+相机识别目标颜色的物块 / 色环，把"是否存在 / 颜色 / 是块还是环 / 中心像素坐标 / 尺寸"
+按 **640×480 像素坐标**打成 20 字节串口帧；STM32 拿坐标做"居中 + 抵近"，
+并在自己的流程里决定抓哪个、放到哪个环、什么时候动。
 
 - 协议定稿：[相机_主控串口通信协议_定稿.md](相机_主控串口通信协议_定稿.md)
 - 硬件：MaixCAM（SG2002）+ STM32H723ZGT6
@@ -14,9 +15,9 @@ STM32 拿去做"居中 + 抵近"，靠近到可以抓取的位置后下爪。
 
 ```
 E:\maxican\
-├─ 相机_主控串口通信协议_定稿.md        协议定稿（唯一基准，三套实现都对齐它）v3.0
+├─ 相机_主控串口通信协议_定稿.md        协议定稿（唯一基准，三套实现都对齐它）v4
 ├─ 现场使用手册.md                      **装到车上真正跑起来的操作手册（先看这个）**
-├─ 搬运任务模式.md                      **比赛规则对照 + 搬运模式用法（任务码/两批流程/标定）**
+├─ 搬运任务模式.md                      **比赛规则对照 + 本地演示模式（正式流程已移到 STM32）**
 ├─ 现场测试清单.md                      **上机实测的分阶段流程（每步都有通过标准）**
 ├─ 附件1-智能搬运比赛规则1018 (1).docx   比赛规则原文
 ├─ device_test_report.md                真机验证报告（实测数据、踩坑记录）
@@ -34,7 +35,7 @@ E:\maxican\
 │   └─ color_tracker\                   应用包（app.yaml + main.py + app.png）
 ├─ pc\
 │   ├─ protocol.py                      协议纯逻辑（组帧/解帧/流式解析，无依赖）
-│   ├─ ground_station.py                **上位机图形界面**（实时画面框/状态/命令/CSV）
+│   ├─ ground_station.py                **上位机图形界面**（实时画面框/目标信息/选色命令/CSV）
 │   ├─ serial_monitor.py                上位机命令行版（CH340 联调用）
 │   ├─ serial_capture.ps1               不依赖 pyserial 的串口抓包（.NET 串口）
 │   ├─ field_test.ps1                   **现场一键工具**（部署/运行/拉图/改配置/重启）
@@ -76,12 +77,16 @@ E:\maxican\
 ### 3.1 跑起来
 
 1. 用 MaixVision 打开 `camera/maixcam_color_tracker.py`，直接运行。
-2. 屏幕上会显示当前追踪颜色、`xn/yn/wn/hn` 归一化值、帧率和帧序号，方便肉眼确认。
+2. 屏幕上会显示当前追踪颜色、目标框和帧率。v4 帧里**没有帧序号**，丢帧只能看帧率。
+   ⚠ 当前屏幕叠加层/日志**还没完全迁到 v4**：代码里仍会打印 `xn/yn/seq` 等旧字段；
+   **坐标以上位机或串口解析结果为准**（`serial_monitor.py` / `ground_station.py`），
+   屏幕字段待后续统一。
 3. 退出程序后系统会自动回到桌面启动器，**不会黑屏**。
 
 程序上电默认按 `CONFIG["default_color"]`（默认红）持续上报，
-收到主控的 `SET_COLOR` 后立即切换；`SAVE` 命令会把颜色和帧率写进
-`/root/color_tracker_cfg.json`，掉电保留。
+收到主控的 4 字节选色命令（`AA BB 01/02/03 FF`）后立即切换，之后一直按这个颜色识别。
+v4 **没有 `SAVE` 命令**：要持久化颜色/帧率就改配置文件 `/root/color_tracker_cfg.json`，
+或者在触摸界面按 `SAVE`（只写颜色、帧率、阈值等，不涉及协议）。
 
 程序支持在设备上（SSH）直接用命令行参数覆盖配置，便于分阶段上机调试：
 
@@ -130,13 +135,13 @@ ssh -n root@10.171.126.1 "sync ; sleep 1 ; /sbin/reboot -f"
 
 ### 3.3 真机实测结果
 
-见 [device_test_report.md](device_test_report.md)。摘要：
+见 [device_test_report.md](device_test_report.md)（v2/v3 历史实测）和协议定稿 §5（v4 帧率）。摘要：
 
 | 测试 | 结果 |
 | --- | --- |
-| 视觉链路 640×480 | ~29.5 fps（受程序 30fps 节流上限限制），无异常 |
-| 几何自检 `--test-full` | 整幅画面 → `xn=128 yn=128 wn=255 hn=191`，**与协议推导值逐项吻合** |
-| 串口 `/dev/ttyS1` | 8 秒发送 232 帧，坏帧 0，A19/A18 的 pinmap 正常 |
+| 视觉链路 640×480 | v4 稳定 **14~16 fps**（瓶颈是 `find_blobs`，`SET_FPS` 已取消） |
+| 几何自检 `--test-full` | 整幅画面按 v4 换算应为**中心 (320,240)、w=640、h=480 像素**（旧报告里的 `xn=128 yn=128 wn=255 hn=191` 是 v3 归一化时代的数据，**待 v4 真机复测**） |
+| 串口 `/dev/ttyS1` | 旧版记录 8 秒 232 帧、坏帧 0；v4 帧长 20 字节，建议用 `pc\serial_monitor.py` 复核 |
 | 退出 | 每次都打印 `maix multi-media driver released.`，驱动正确释放 |
 
 ### 3.4 标定颜色阈值（**必须做，别跳过**）
@@ -198,7 +203,7 @@ ssh -n root@10.171.126.1 "sync ; sleep 1 ; /sbin/reboot -f"
 | --- | --- |
 | 进程 | `298 root python3 /maixapp/apps/color_tracker/main.py auto_start` |
 | 摄像头 / 屏幕 / 串口 | `/proc/298/fd` 里 `/dev/cvi-vi`、`/dev/cvi-vo`、**`/dev/ttyS1`（fd 7）全部打开** |
-| 帧率 | 稳定 ~29.5fps，`seq` 持续递增并多次回绕 → 帧在持续发送 |
+| 帧率 | v4 实测 14~16fps；**没有 seq**，只能靠帧率和坏帧数判断在持续发送 |
 | 应用日志 | 实时写入 `/maixapp/tmp/last_run.log` |
 | 设备是否卡死 | 否，`ps` 正常（**说明由启动器启动时它会正常让出屏幕**，不会像 SSH 直跑那样死锁） |
 
@@ -212,8 +217,9 @@ ssh -n root@10.171.126.1 "sync ; sleep 1 ; /sbin/reboot -f"
 1. **自启之后 MaixVision 连不上设备**（应用占着摄像头和屏幕）。要改代码就先
    `rm /maixapp/auto_start.txt` 或 SSH 进去 `kill` 掉进程，重启后再改。
 2. **自启版本不要带 `--duration`**，否则程序跑一会儿自己退出。
-3. **默认颜色要先持久化**：改 `CONFIG["default_color"]` 后重新部署，或者让主控发一次
-   `SAVE` 命令（会写 `/root/color_tracker_cfg.json`，上电自动读）。默认是红色。
+3. **默认颜色要先持久化**：改 `CONFIG["default_color"]` 后重新部署，或者在触摸界面按
+   `SAVE`（写 `/root/color_tracker_cfg.json`，上电自动读）。默认是红色。
+   v4 没有 `SAVE` 协议命令，主控不能再"发条命令让相机存配置"。
 4. 设备上**没有 `timeout` 命令**，别指望用它限时。
 
 在设备上手动退出应用：按一下机身的功能键（`user` 键）→ 程序 `app.need_exit()` 返回
@@ -241,24 +247,24 @@ python pc\ground_station.py --demo          # 演示模式：不接任何硬件
 
 | 区域 | 内容 |
 | --- | --- |
-| 左 | 把归一化坐标还原成画面框，**按颜色上色**，带移动轨迹；无目标时显示"搜索中" |
-| 右·状态 | 状态机阶段 / 颜色 / 序号 / 帧率 / 丢帧 / 坏帧 / **最近回执** |
-| 右·坐标 | x y w h 的 `归一化值 → 画布像素`，以及相对中心的偏差 Δx Δy |
-| 右·控制 | PING / NEXT / ABORT / RUN / SAVE / CAL / 切颜色 / 设帧率 / 录 CSV |
-| 下 | 日志：状态变化、下发命令的十六进制、**相机的 OK / FAIL 回执** |
+| 左 | 按 **640×480 参考系**把目标框等比画到画布（窗口缩放时留黑边，不拉伸），**按颜色上色**，带移动轨迹；无目标时画布提示"画面里没有目标" |
+| 右·目标 | 有无目标 / 颜色 / 形状（色环或色块，色环带角度）/ 帧率 / 坏帧 / 中心 x y / 尺寸 w h / 相对中心的偏差 Δx Δy |
+| 右·控制 | **红 / 绿 / 蓝** 三个选色按钮 + **PING**，另有录制 CSV、清空日志 |
+| 下 | 日志：目标有无/颜色/环块变化、本机下发命令的十六进制、每秒统计 |
 
 几个细节：
 
-- **回执会单独显示。** 相机每收到一条命令都回一帧 `CC CC DD DD`，和数据帧走同一根线。
-  上位机用 `MixedParser` 同时认这两种帧头，所以命令到底成功没有，日志里一眼可见
-  （比如搬运模式下按 CAL 会明确显示 `CALIBRATE FAIL`）。
+- **没有回执。** v4 的下行只有 4 字节，相机收到命令不会回 OK/FAIL。日志里只记录
+  "本机发出了什么"，命令是否生效要看相机下一帧的目标框有没有换颜色。
+  `PING` 是唯一有反馈的：相机收到 `AA BB 7F FF` 会立刻补发一帧上行数据。
 - **帧率是把"每秒收到多少帧"算出来的**，能直接看出相机是不是跑不动了。
-- **丢帧按序号推算**，坏帧是校验和/帧尾不对的次数 —— 这两个数一涨就是接线或波特率的问题。
+- **只有坏帧，没有丢帧。** v4 没有帧序号，"应该收到多少帧"无从得知，所以界面上
+  不显示丢帧率；坏帧是校验和/帧尾不对的次数，一涨就是接线或波特率的问题。
 - **录制 CSV** 存到 `captures\gs-时间.csv`，离线复盘用（Excel 直接打开）。
-- 画面区会跟着窗口缩放，归一化坐标铺满不留白。
+- 画面区会跟着窗口缩放，但**始终按 640×480 等比映射**，不会把坐标拉变形。
 
-`--demo` 模式自己造一整套搬运周期（搜索→对准→可抓→对准目标区→可放→完成），
-没有相机也能把界面和流程跑通，给老师演示很方便。
+`--demo` 模式自己造目标：在 640×480 画面里移动、换颜色、换环/块、偶尔消失，
+没有相机也能把界面和链路演示跑通，给老师演示很方便（它不模拟 STM32 的搬运流程）。
 
 ### 4.2 命令行版
 
@@ -267,11 +273,11 @@ python pc\ground_station.py --demo          # 演示模式：不接任何硬件
 ```powershell
 python pc\serial_monitor.py --list                      # 找串口号
 python pc\serial_monitor.py --port COM5                 # 监听
-python pc\serial_monitor.py --port COM5 --color green --repeat
+python pc\serial_monitor.py --port COM5 --color green   # 启动时下发一次选绿色
 ```
 
-`--repeat` 会每 200ms 重发一次启动命令，直到收到相机第一帧 —— 对应"相机开机十几秒、
-主控早就上电了"的真实场景。
+`--color` 只发**一次**就够：v4 规定"收到一帧指令后一直按这个颜色识别"，
+所以 v3 时代的 `--repeat`（每 200ms 重发）已经删掉了。
 
 不想接硬件也能先验证工具本身：
 
@@ -286,21 +292,19 @@ python pc\serial_monitor.py --simulate --duration 5
 
 | 输入 | 作用 |
 | --- | --- |
-| `r` / `g` / `b` | 切换追踪红 / 绿 / 蓝 |
-| `run` / `stby` | 运行 / 待机 |
-| `fps 30` | 设置相机发送帧率 |
-| `ping` | 链路自检 |
-| `save` | 让相机保存当前配置 |
+| `r` / `g` / `b` | 切换追踪红 / 绿 / 蓝（发 4 字节下行） |
+| `ping` | 链路自检（相机收到会立刻补发一帧） |
 | `q` | 退出 |
 
-输出长这样（`dx/dy` 是相对画面几何中心的偏差，正=偏右/偏下）：
+输出长这样（坐标都是 **640×480 参考系下的中心像素**）：
 
 ```
-seq=  8  TARGET green  xn=125( 49.0%) yn=199( 78.0%)  wn= 51 hn= 43  dx=  -3 dy= +71
-  ── 速率 30.1 帧/秒   累计 305 帧   无目标 12   丢帧 0   坏帧 0
+存在 · green · 色块 · 中心 ( 314, 375) · 尺寸 ( 51× 43)
+  ── 速率 15.2 帧/秒   累计 305 帧   无目标 12   坏帧 0
+无   · green · —    · 中心 (   —,   —) · 尺寸 (  —×  —)
 ```
 
-结束时打印累计帧数、无目标帧数、丢帧数、校验失败数。
+结束时打印累计帧数、无目标帧数、色环/色块数、校验失败数。
 
 ---
 
@@ -309,27 +313,40 @@ seq=  8  TARGET green  xn=125( 49.0%) yn=199( 78.0%)  wn= 51 hn= 43  dx=  -3 dy=
 ### 5.1 把协议文件加进工程
 
 把 `stm32/mx_protocol.h`、`stm32/mx_protocol.c` 加进你的工程即可，**它不依赖 HAL**，
-只用 `<string.h>`，可以在任何 STM32 工程里直接用。
+只用 `<stdint.h>` / `<stdbool.h>` / `<stddef.h>` / `<string.h>`，可以在任何 STM32 工程里直接用。
+v4 的 API 以 `stm32/mx_protocol.h` 为准，旧的 `mx_parser_t` / `mx_parser_feed` /
+`MX_DOWN_FRAME_LEN` / `MX_CMD_SET_COLOR` 都不存在了。
 
 ### 5.2 用 DMA + 空闲中断收帧（推荐）
 
-H723 上最省 CPU 的写法：让 DMA 收一整段，再喂进状态机。
+H723 上最省 CPU 的写法：让 DMA 收一整段，再一次性喂进 v4 流式解析器。
 
 ```c
 #include "mx_protocol.h"
 
-static mx_parser_t  g_parser;
+static mx_uplink_parser_t g_parser;
 static uint8_t      g_rx_buf[64];
 static mx_uplink_t  g_last;               /* 最新一帧 */
 static volatile uint8_t  g_new_frame;
 static volatile uint32_t g_last_frame_ms;
-static uint8_t      g_center_x = 141;     /* ← 标定后填入，不要用 128 */
-static uint8_t      g_center_y = 118;     /* ← 标定后填入 */
-static uint8_t      g_grab_w_n = 150;     /* ← 标定后填入 */
+
+/* 标定值：640×480 参考系下的**像素**。先用画面几何中心，现场标定后改。 */
+static uint16_t g_center_x  = 320;        /* ← 标定后填入 */
+static uint16_t g_center_y  = 240;        /* ← 标定后填入 */
+static uint16_t g_grab_w_px = 150;        /* ← 够近时目标的 w，标定后填入 */
+
+/* 每解出一帧回调一次 */
+static void on_uplink(const mx_uplink_t *f, void *user)
+{
+    (void)user;
+    g_last = *f;
+    g_last_frame_ms = HAL_GetTick();
+    g_new_frame = 1;
+}
 
 void app_camera_init(void)
 {
-    mx_parser_init(&g_parser);
+    mx_uplink_parser_init(&g_parser);
     /* 用 ReceiveToIdle_DMA，空闲中断会回调 RxEventCallback */
     HAL_UARTEx_ReceiveToIdle_DMA(&huart1, g_rx_buf, sizeof(g_rx_buf));
     /* 关键：关掉"半传输中断"，否则缓冲区收一半也会回调，容易重复处理 */
@@ -340,27 +357,22 @@ void app_camera_init(void)
 void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
 {
     if (huart->Instance == USART1) {
-        for (uint16_t i = 0; i < Size; i++) {
-            mx_uplink_t f;
-            if (mx_parser_feed(&g_parser, g_rx_buf[i], &f)) {
-                g_last = f;
-                g_last_frame_ms = HAL_GetTick();
-                g_new_frame = 1;
-            }
-        }
+        /* 一次喂一段：内部处理拆包、粘包、坏帧后重新同步 */
+        mx_uplink_parser_feed(&g_parser, g_rx_buf, Size, on_uplink, NULL);
         HAL_UARTEx_ReceiveToIdle_DMA(huart, g_rx_buf, sizeof(g_rx_buf));
     }
 }
 
-/* 下发命令 */
-void camera_set_color(uint8_t color)
+/* 下发 4 字节：AA BB cmd FF。cmd = MX_CMD_RED / GREEN / BLUE，PING 只用于调试 */
+static void camera_send_cmd(uint8_t cmd)
 {
-    uint8_t frame[MX_DOWN_FRAME_LEN];
-    mx_build_downlink(MX_CMD_SET_COLOR, color, frame);
-    HAL_UART_Transmit(&huart1, frame, MX_DOWN_FRAME_LEN, 20);
+    uint8_t frame[MX_DOWNLINK_FRAME_LEN];
+    if (mx_build_downlink(cmd, frame) == MX_OK) {
+        HAL_UART_Transmit(&huart1, frame, MX_DOWNLINK_FRAME_LEN, 20);
+    }
 }
 
-/* 主循环 */
+/* 主循环（只做居中 + 抵近；任务码顺序/区/环由更上层的搬运流程决定） */
 void app_camera_task(void)
 {
     static uint32_t t_retry = 0;
@@ -369,10 +381,8 @@ void app_camera_task(void)
     /* 1) 上电重传：相机开机十几秒，命令会丢，所以周期重发直到收到第一帧 */
     if (!camera_alive && HAL_GetTick() - t_retry >= 200) {
         t_retry = HAL_GetTick();
-        camera_set_color(MX_COLOR_RED);
-        uint8_t frame[MX_DOWN_FRAME_LEN];
-        mx_build_downlink(MX_CMD_PING, 0, frame);
-        HAL_UART_Transmit(&huart1, frame, MX_DOWN_FRAME_LEN, 20);
+        camera_send_cmd(MX_CMD_RED);
+        camera_send_cmd(MX_CMD_PING);      /* 可选：让相机立刻补发一帧 */
     }
 
     /* 2) 超时保护：超过 100ms 没有有效帧 -> 判定相机掉线，立即停车 */
@@ -394,17 +404,18 @@ void app_camera_task(void)
         return;
     }
 
-    /* 4) 居中 + 抵近 */
-    int dx = mx_dx(&g_last, g_center_x);   /* >0 偏右 */
-    int dy = mx_dy(&g_last, g_center_y);   /* >0 偏下 */
+    /* 4) 居中 + 抵近：x / y 是目标中心，参考系固定 640x480 */
+    int dx = (int)g_last.x - (int)g_center_x;   /* >0 偏右 */
+    int dy = (int)g_last.y - (int)g_center_y;   /* >0 偏下 */
 
     if (dx >  4) chassis_turn_right();
     if (dx < -4) chassis_turn_left();
     if (dy >  4) chassis_forward();
     if (dy < -4) chassis_backward();
 
-    /* 5) 对准且足够近 -> 下爪 */
-    if (dx >= -4 && dx <= 4 && dy >= -4 && dy <= 4 && g_last.w_n >= g_grab_w_n) {
+    /* 5) 对准、够近、而且是物块（bit7=0 不是色环）-> 下爪 */
+    if (dx >= -4 && dx <= 4 && dy >= -4 && dy <= 4 &&
+        !mx_uplink_is_ring(&g_last) && g_last.w >= g_grab_w_px) {
         chassis_stop();
         gripper_close();
     }
@@ -412,7 +423,11 @@ void app_camera_task(void)
 ```
 
 > 上面是骨架，`chassis_*` / `gripper_*` 换成你自己的函数。
-> 完整控制说明见协议文档第 5 节。
+> 几个 v4 特有的点：
+> - **没有 `state`、没有 `seq`、没有回执**。要不要抓/放，主控自己用
+>   `exists / x / y / w / h / mx_uplink_is_ring()` 判断；抓完也不用等相机确认。
+> - 色环标志在 `mx_uplink_is_ring()`（第 6 字节 bit7），角度用 `mx_uplink_angle()`。
+> - 完整分工说明见协议文档第 4 节。
 
 ---
 
@@ -426,28 +441,34 @@ gcc -std=c99 -Wall -Wextra -o host_test.exe host_test.c mx_protocol.c
 .\host_test.exe
 ```
 
-覆盖：文档示例帧、逐字节喂入、噪声、坏帧重同步、假帧头恢复、粘包、
-下行组帧与回执、校验和溢出。
+覆盖：v4 文档示例帧（20 字节）、逐字节喂入、噪声、坏帧重同步、假帧头恢复、粘包、
+下行 4 字节组帧与解析、角度/色环标志、校验和范围（偏移 4~14）。
 
-### 6.2 Python 跨实现一致性
+### 6.2 Python 测试（当前仍是 v3.0 用例）
 
 ```powershell
 python tests\test_protocol.py
 ```
 
-覆盖：三套实现的组帧字节比对、校验和一致、流式解析、归一化换算、
+覆盖（设计目标）：三套实现的组帧字节比对、校验和一致、流式解析、像素坐标换算、
 色块转帧、阈值表合法性、上位机命令映射、模拟模式与相机端换算一致、
-**混合流解析（数据帧+回执帧）、上位机画面换算、演示数据源**。
+上位机画面换算、演示数据源。
 
-**当前状态**：
+**当前状态（2026-10-30 实跑）**：
 
-| 测试 | 断言数 |
+| 测试 | 状态 |
 | --- | --- |
-| `tests/test_protocol.py` | 308 |
-| `tests/test_mission.py` | 220 |
-| `tests/test_vision_sim.py` | 44 |
-| `stm32/host_test.c`（gcc） | 43 |
-| **合计** | **615** |
+| `tests/test_protocol.py`（v4 协议一致性） | ✅ **87 项通过** |
+| `tests/test_mission.py`（本地状态机 / 触摸界面 / 配置） | ✅ **191 项通过** |
+| `tests/test_vision_sim.py`（假图像跑真识别链路） | ✅ **40 项通过** |
+| `stm32/host_test.c`（gcc） | ✅ **196 项通过** |
+| **合计** | **Python 318 项 + C 196 项，全部通过** |
+
+> 三套 Python 测试已按 v4 重写（2026-10-30）。协议部分以文档示例帧为
+> **黄金向量**：`aa aa bb bb 01 02 15 64 00 c8 00 32 00 1e 00 94 ff ff ee ee`
+> 在相机端、上位机端、C 端三处都逐字节比对。
+>
+> 旧版 README 写的 308 / 220 / 44 / 43（合计 615）是 v3.0 时代的数字，**已作废**。
 
 ---
 
@@ -456,14 +477,17 @@ python tests\test_protocol.py
 | 项 | 状态 |
 | --- | --- |
 | 颜色阈值 | **入门值，必须实机重新标定**（用设备自带「找色块」应用） |
-| `CENTER_X` / `CENTER_Y` | **空值待标定**：相机光心与爪子中心不重合，必须在抓取高度上标一次 |
-| `GRAB_W_N` | **空值待标定**：能稳定抓住时的 `w_n` |
-| 画面分辨率 | 默认 640×480，可改；协议已归一化，改分辨率不影响主控。若你的摄像头模组不支持该分辨率（有些只给 320×240 / 1280×720），直接改成支持的值即可 |
-| GPIO 硬急停 | **协议已定义但未启用**，引脚待实机确认（避开 A16/A17/A18/A19） |
+| `CENTER_X` / `CENTER_Y` | **空值待标定**：相机光心与爪子中心不重合，必须在抓取高度上标一次；单位是 **640×480 像素** |
+| `GRAB_W_PX` | **空值待标定**：能稳定抓住时的目标宽度 `w`（像素，不是旧的 `w_n`） |
+| 帧率 | **实测 14~16 fps**（`find_blobs` 三色 45~70ms 是瓶颈）。`SET_FPS` 已取消，帧率由配置文件 `fps` 决定 |
+| 帧序号 / 丢帧 | **v4 没有 seq**，无法推算丢帧；只能用帧率、坏帧数和"断流超时"判断链路 |
+| 画面分辨率 | 默认 640×480，可改；**送出坐标固定换算回 640×480 参考系**，改内部识别分辨率不影响主控。若摄像头只给 320×240，坐标仍按 640×480 上报 |
+| GPIO 硬急停 | **v4 协议没有急停字段/命令**；代码里只有一个未启用的配置项，引脚待实机确认（避开 A16/A17/A18/A19） |
 | 透视校正 | 相机与爪子平行安装，**不需要**；若日后改斜装，需在相机内做四角标定 |
 | 多色同时识别 | 不支持，一次只追一色（协议按此设计） |
 | pyserial | 当前环境未安装，真实串口模式需要先装 |
-| 相机端代码 | **已在真机跑通**（MaixCAM / SG2002 / MaixPy 4.8.2），视觉链路 ~29.5fps、几何换算逐值吻合、串口发送正常、退出干净 |
+| 相机端代码 | v2/v3 时代**已在真机跑通**（MaixCam / SG2002 / MaixPy 4.8.2）；v4 的 20 字节组帧/解析已改，但屏幕叠加和日志里仍残留 `xn/seq` 旧字段，**待 v4 真机复测** |
 | 电气链路 | **未验证**：`A19`→STM32 RX、`A18`←STM32 TX、共地，需接上主控或用 CH340 抓包确认 |
-| 下行指令双向联调 | **未在真机验证**（逻辑已被单元测试覆盖），需要 PC 或 STM32 往 `ttyS1` 发帧 |
+| 下行指令双向联调 | **未在真机验证**：v4 下行只有 4 字节（`01/02/03` 选色、`7F` PING），需要 PC 或 STM32 往 `ttyS1` 实际发帧 |
+| 测试套件 | **Python 318 项 + C 196 项全部通过**（见 §6.2） |
 | 长时间稳定性 | 只跑过 8~15 秒短测，未做长时间连续运行观察 |
