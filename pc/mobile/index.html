@@ -1,0 +1,390 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1">
+<meta name="theme-color" content="#131316">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>MaixCAM 视觉 · 手机上位机</title>
+<style>
+/* ============================================================
+   Material You（Android 17 / Material 3）深色方案
+   - 颜色全部集中在这几个变量里，想换主题只改这里
+   - 尺寸用 clamp() 按视口缩放，手机竖屏 / 横屏 / 平板都成立
+   ============================================================ */
+:root{
+  --surface:#131316;
+  --surface-1:#1d1b20;
+  --surface-2:#232028;
+  --surface-3:#2b2930;
+  --surface-4:#36343b;
+  --on-surface:#e7e0e8;
+  --on-surface-var:#cac4d0;
+  --on-surface-dim:#938f99;
+  --primary:#d0bcff;
+  --on-primary:#381e72;
+  --primary-cont:#4f378b;
+  --secondary:#ccc2dc;
+  --error:#f2b8b5;
+  --error-cont:#8c1d18;
+  --red:#ff8a8f; --green:#7edca2; --blue:#9ccaff;
+  --r-l:28px; --r-m:20px; --r-s:14px;
+  --pad:clamp(10px,3.2vw,18px);
+  --gap:clamp(8px,2.4vw,14px);
+}
+
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{height:100%}
+body{
+  margin:0;background:var(--surface);color:var(--on-surface);
+  font-family:system-ui,-apple-system,"Roboto","Noto Sans SC","PingFang SC",sans-serif;
+  overflow:hidden;
+  padding:env(safe-area-inset-top) env(safe-area-inset-right)
+          env(safe-area-inset-bottom) env(safe-area-inset-left);
+  display:flex;flex-direction:column;
+  user-select:none;
+}
+
+/* ---------------- 顶栏 ---------------- */
+header{
+  flex:0 0 auto;display:flex;align-items:center;gap:12px;
+  padding:calc(var(--pad)*0.8) var(--pad);
+}
+.dot{width:10px;height:10px;border-radius:50%;background:var(--surface-4);
+     flex:0 0 auto;transition:background .2s}
+.dot.on{background:var(--green)}
+.dot.warn{background:#efc06b}
+header .title{font-size:clamp(15px,4.2vw,19px);font-weight:700;letter-spacing:.2px}
+header .sub{font-size:clamp(11px,3.1vw,13px);color:var(--on-surface-dim)}
+header .spacer{flex:1}
+.fps{
+  font-variant-numeric:tabular-nums;font-size:clamp(13px,3.6vw,16px);font-weight:700;
+  padding:6px 14px;border-radius:999px;background:var(--surface-3);color:var(--on-surface-dim);
+}
+.fps.on{background:var(--primary-cont);color:var(--primary)}
+
+/* ---------------- 主体 ---------------- */
+main{
+  flex:1 1 auto;min-height:0;display:flex;flex-direction:column;
+  gap:var(--gap);padding:0 var(--pad) var(--pad);
+}
+
+/* 画面卡 */
+.video{
+  position:relative;flex:1 1 auto;min-height:0;
+  background:var(--surface-1);border-radius:var(--r-l);
+  overflow:hidden;display:flex;align-items:center;justify-content:center;
+}
+.video canvas{display:block;width:100%;height:100%}
+.badge{
+  position:absolute;left:12px;top:12px;
+  font-size:clamp(11px,3vw,13px);color:var(--on-surface-dim);
+  font-variant-numeric:tabular-nums;
+}
+.stale{
+  position:absolute;left:50%;top:14px;transform:translateX(-50%);
+  background:var(--error-cont);color:var(--error);
+  padding:8px 18px;border-radius:999px;font-weight:700;
+  font-size:clamp(12px,3.4vw,15px);display:none;
+}
+
+/* 卡片 */
+.card{background:var(--surface-1);border-radius:var(--r-l);padding:var(--pad)}
+.card h2{
+  margin:0 0 6px;font-size:clamp(11px,3vw,13px);font-weight:600;
+  color:var(--on-surface-var);letter-spacing:.4px;
+}
+
+/* 目标卡 */
+.target{flex:0 0 auto;display:flex;align-items:center;gap:var(--gap)}
+.target .big{
+  font-size:clamp(24px,8vw,38px);font-weight:800;line-height:1.05;
+  letter-spacing:-.5px;
+}
+.target .meta{display:flex;align-items:center;gap:8px;margin-top:4px;
+              font-size:clamp(13px,3.7vw,16px);color:var(--on-surface-var)}
+.chip{
+  width:12px;height:12px;border-radius:50%;background:var(--on-surface-dim);
+  flex:0 0 auto;
+}
+.shape{
+  margin-left:auto;text-align:right;font-size:clamp(12px,3.4vw,15px);
+  color:var(--on-surface-var);line-height:1.5;font-variant-numeric:tabular-nums;
+}
+.shape b{color:var(--on-surface);font-weight:700}
+
+/* 按钮区 */
+.controls{flex:0 0 auto;display:flex;flex-direction:column;gap:var(--gap)}
+.seg{
+  display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px;
+  background:var(--surface-3);border-radius:999px;padding:6px;
+}
+.seg button{
+  height:clamp(46px,13vw,60px);border:0;border-radius:999px;background:transparent;
+  font-size:clamp(16px,4.8vw,20px);font-weight:800;font-family:inherit;
+  color:var(--on-surface);transition:background .15s,transform .06s;
+}
+.seg button:active{transform:scale(.96)}
+.seg button.red{color:var(--red)} .seg button.green{color:var(--green)}
+.seg button.blue{color:var(--blue)}
+.seg button.sel.red{background:#4a2226} .seg button.sel.green{background:#1f3a2a}
+.seg button.sel.blue{background:#1e3350}
+
+.row{display:grid;grid-template-columns:1fr 1fr;gap:var(--gap)}
+.btn{
+  height:clamp(44px,12vw,56px);border:0;border-radius:999px;
+  background:var(--surface-3);color:var(--on-surface);
+  font-size:clamp(14px,4vw,17px);font-weight:700;font-family:inherit;
+  transition:background .15s,transform .06s;
+}
+.btn:active{transform:scale(.97);background:var(--surface-4)}
+.btn.primary{background:var(--primary);color:var(--on-primary)}
+.btn.active{background:var(--primary-cont);color:var(--primary)}
+
+/* 横屏：画面在左，信息在右 */
+@media (orientation:landscape){
+  main{flex-direction:row}
+  .video{flex:1 1 58%}
+  .side{
+    flex:1 1 42%;display:flex;flex-direction:column;gap:var(--gap);
+    min-width:0;justify-content:center;
+  }
+}
+@media (orientation:portrait){
+  .side{display:contents}   /* 竖屏时直接按 main 的纵向排列 */
+}
+</style>
+</head>
+<body>
+
+<header>
+  <span class="dot" id="dot"></span>
+  <div>
+    <div class="title">MaixCAM 视觉</div>
+    <div class="sub" id="conn">正在连接…</div>
+  </div>
+  <span class="spacer"></span>
+  <span class="fps" id="fps">— fps</span>
+</header>
+
+<main>
+  <div class="video" id="videoWrap">
+    <canvas id="cv"></canvas>
+    <span class="badge" id="badge"></span>
+    <span class="stale" id="stale">数据过期</span>
+  </div>
+
+  <div class="side">
+    <div class="card target">
+      <div>
+        <h2>目标</h2>
+        <div class="big" id="state">等待中</div>
+        <div class="meta">
+          <span class="chip" id="colorDot"></span>
+          <span id="colorTxt">—</span>
+        </div>
+      </div>
+      <div class="shape" id="shapeTxt"></div>
+    </div>
+
+    <div class="controls">
+      <div class="seg" id="seg">
+        <button class="red"   data-c="1" data-n="red">红</button>
+        <button class="green" data-c="2" data-n="green">绿</button>
+        <button class="blue"  data-c="3" data-n="blue">蓝</button>
+      </div>
+      <div class="row">
+        <button class="btn" id="ping">PING</button>
+        <button class="btn" id="rec">录制</button>
+      </div>
+    </div>
+  </div>
+</main>
+
+<script>
+"use strict";
+/* ============================================================
+   与相机端 net_server.py 的接口（极简，HTTP 轮询就够）：
+     GET  /api/latest   -> {ok, exists, color, color_name, is_ring,
+                            angle, cx, cy, w, h, fps, t}
+     POST /api/cmd      -> {c: 1|2|3} 选色；c=0x7f 是 PING
+   为什么不用 WebSocket：手机浏览器 + Python 标准库，轮询最省事，
+   15~20Hz 的轮询在 WiFi 上开销可以忽略。
+   ============================================================ */
+
+const cv = document.getElementById("cv");
+const ctx = cv.getContext("2d");
+const el = (id) => document.getElementById(id);
+const COLOR = {red:"#ff8a8f", green:"#7edca2", blue:"#9ccaff"};
+const CNAME = {red:"红", green:"绿", blue:"蓝"};
+
+let lastFrame = null;
+let lastOk = 0;          // 最近一次成功的时间
+let curColor = null;     // 当前选中的颜色（本地高亮用）
+let recording = false;
+let trail = [];          // 轨迹，最多 28 个点
+
+// ---------- 画布按设备像素比放大，避免高分屏发虚 ----------
+function resize() {
+  const dpr = window.devicePixelRatio || 1;
+  const r = cv.parentElement.getBoundingClientRect();
+  cv.width = Math.max(1, Math.round(r.width * dpr));
+  cv.height = Math.max(1, Math.round(r.height * dpr));
+  draw();
+}
+window.addEventListener("resize", resize);
+window.addEventListener("orientationchange", () => setTimeout(resize, 120));
+
+// ---------- 绘制 ----------
+function draw() {
+  const W = cv.width, H = cv.height;
+  ctx.clearRect(0, 0, W, H);
+  ctx.fillStyle = "#0c0c0f";
+  ctx.fillRect(0, 0, W, H);
+  if (W < 10 || H < 10) return;
+
+  // 4:3 等比视口（坐标参考系固定 640x480）
+  let vw = W, vh = W * 3 / 4;
+  if (vh > H) { vh = H; vw = H * 4 / 3; }
+  const vx = (W - vw) / 2, vy = (H - vh) / 2;
+
+  // 网格
+  ctx.strokeStyle = "#17171c";
+  ctx.lineWidth = Math.max(1, W / 900);
+  for (let i = 1; i < 4; i++) {
+    ctx.beginPath(); ctx.moveTo(vx + vw * i / 4, vy); ctx.lineTo(vx + vw * i / 4, vy + vh); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(vx, vy + vh * i / 4); ctx.lineTo(vx + vw, vy + vh * i / 4); ctx.stroke();
+  }
+  // 中心十字
+  ctx.strokeStyle = "#26262e"; ctx.setLineDash([W / 120, W / 60]);
+  ctx.beginPath(); ctx.moveTo(vx + vw / 2, vy); ctx.lineTo(vx + vw / 2, vy + vh); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(vx, vy + vh / 2); ctx.lineTo(vx + vw, vy + vh / 2); ctx.stroke();
+  ctx.setLineDash([]);
+
+  const f = lastFrame;
+  if (!f || !f.exists) {
+    ctx.fillStyle = "#938f99";
+    ctx.font = `600 ${Math.round(W / 22)}px system-ui, sans-serif`;
+    ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.fillText(lastOk ? "画面里没有目标" : "等待数据…", vx + vw / 2, vy + vh / 2);
+    return;
+  }
+
+  const col = COLOR[f.color_name] || "#938f99";
+  const cx = vx + f.cx / 640 * vw;
+  const cy = vy + f.cy / 480 * vh;
+  const bw = f.w / 640 * vw;
+  const bh = f.h / 480 * vh;
+
+  // 轨迹
+  trail.push([cx, cy]);
+  if (trail.length > 28) trail.shift();
+  if (trail.length > 1) {
+    ctx.strokeStyle = "#36343b"; ctx.lineWidth = Math.max(2, W / 400);
+    ctx.beginPath();
+    trail.forEach((p, i) => i ? ctx.lineTo(p[0], p[1]) : ctx.moveTo(p[0], p[1]));
+    ctx.stroke();
+  }
+
+  // 框
+  ctx.strokeStyle = col;
+  ctx.lineWidth = Math.max(2, W / 180);
+  ctx.strokeRect(cx - bw / 2, cy - bh / 2, bw, bh);
+  // 中心点
+  ctx.fillStyle = col;
+  ctx.beginPath();
+  ctx.arc(cx, cy, Math.max(3, W / 170), 0, Math.PI * 2);
+  ctx.fill();
+  // 到画面中心的连线
+  if (Math.abs(f.cx - 320) > 4 || Math.abs(f.cy - 240) > 4) {
+    ctx.strokeStyle = "#45414a"; ctx.setLineDash([W / 200, W / 120]);
+    ctx.beginPath(); ctx.moveTo(cx, cy); ctx.lineTo(vx + vw / 2, vy + vh / 2); ctx.stroke();
+    ctx.setLineDash([]);
+  }
+}
+
+// ---------- 更新卡片文字 ----------
+function renderInfo(f) {
+  const dot = el("colorDot"), ctxt = el("colorTxt"), shape = el("shapeTxt");
+  if (!f || !f.exists) {
+    el("state").textContent = f ? "无目标" : "等待中";
+    el("state").style.color = "#938f99";
+    dot.style.background = "#938f99";
+    ctxt.textContent = f ? "正在找 " + (CNAME[f.color_name] || "?") : "—";
+    shape.innerHTML = f ? "" : "";
+    return;
+  }
+  el("state").textContent = "有目标";
+  el("state").style.color = "#e7e0e8";
+  const c = f.color_name;
+  dot.style.background = COLOR[c] || "#938f99";
+  ctxt.textContent = (CNAME[c] || c) + "  " + String(c).toUpperCase();
+  shape.innerHTML =
+    `<b>${f.is_ring ? "色环" : "色块"}</b><br>` +
+    `中心 ${f.cx},${f.cy}<br>` +
+    `尺寸 ${f.w}×${f.h}`;
+}
+
+// ---------- 轮询 ----------
+async function poll() {
+  try {
+    const r = await fetch("/api/latest", {cache: "no-store"});
+    if (!r.ok) throw new Error(r.status);
+    const f = await r.json();
+    lastOk = Date.now();
+    lastFrame = f;
+    el("dot").className = "dot on";
+    el("conn").textContent = "已连接";
+    el("fps").textContent = (f.fps || 0).toFixed(1) + " fps";
+    el("fps").classList.add("on");
+    el("stale").style.display = "none";
+    renderInfo(f);
+    draw();
+  } catch (e) {
+    const idle = (Date.now() - lastOk) / 1000;
+    el("dot").className = "dot warn";
+    el("conn").textContent = lastOk ? `断流 ${idle.toFixed(1)}s` : "连不上相机";
+    el("fps").textContent = "— fps";
+    el("fps").classList.remove("on");
+    if (lastOk) el("stale").style.display = "block";
+    el("stale").textContent = "数据过期 " + idle.toFixed(1) + "s";
+    draw();
+  }
+}
+
+// ---------- 指令 ----------
+async function send(cmd) {
+  try {
+    await fetch("/api/cmd", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({c: cmd}),
+    });
+  } catch (e) { /* 连不上就算了，下一次轮询会把状态刷回来 */ }
+}
+
+document.querySelectorAll("#seg button").forEach((b) => {
+  b.addEventListener("click", () => {
+    curColor = b.dataset.n;
+    document.querySelectorAll("#seg button").forEach((x) =>
+      x.classList.toggle("sel", x.dataset.n === curColor));
+    send(parseInt(b.dataset.c, 10));
+  });
+});
+el("ping").addEventListener("click", () => send(0x7f));
+el("rec").addEventListener("click", () => {
+  recording = !recording;
+  el("rec").classList.toggle("active", recording);
+  el("rec").textContent = recording ? "停止" : "录制";
+  send(recording ? 0x10 : 0x11);   // 0x10 开始 / 0x11 停止（相机端可选支持）
+});
+
+// ---------- 启动 ----------
+resize();
+poll();
+setInterval(poll, 120);          // ~8Hz：够顺滑，手机也省电
+</script>
+</body>
+</html>
