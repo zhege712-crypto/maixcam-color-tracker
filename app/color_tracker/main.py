@@ -5,7 +5,7 @@ MaixCAM 颜色物块追踪 —— 相机端程序
 用途：识别指定颜色的物块，把"是否存在 / 颜色 / 中心位置 / 尺寸"按归一化比例
       打包成 17 字节帧，通过 UART1 发给 STM32H723 主控。
 
-协议：相机_主控串口通信协议_定稿.md（v3.0）
+协议：相机_主控串口通信协议_定稿.md（v4，20 字节上行 / 4 字节下行）
     上行 17 字节，下行 11 字节，115200 8N1
 
 硬件：
@@ -34,7 +34,7 @@ try:
 except Exception:
     pass
 
-PROTOCOL_VERSION = "v3.0"
+PROTOCOL_VERSION = "v4"
 PROGRAM_NAME = "MaixCAM 颜色物块追踪"
 
 # ============================================================ 配置
@@ -674,7 +674,7 @@ def frame_from_blob(color_name, blob, img_w, img_h, is_ring=False):
     return frame, info
 
 
-# ============================================================ v3.0 目标模型
+# ============================================================ 目标模型（环 / 块）
 #
 # 色环和物块是**同一种颜色**，只能靠形状区分：
 #     物块 = 实心（正中也是这个颜色）
@@ -1020,8 +1020,8 @@ def draw_field_ui(canvas, ui, image, line1, line2, msg, running):
         y   0..52   大号任务码（scale 3 ≈ 48px ≈ 5mm，满足规则"字高≥4mm"）
         y  52..56   分隔线
         y  58..    相机画面 + 目标框
-        y 268..368  10 个按钮（5 列 x 2 行）：
-                    1 2 3 CLR RUN / LEARN SAVE G-SZ D-SZ RST
+        y 268..368  8 个按钮（4 列 x 2 行）：
+                    1 2 3 CLR / RUN LEARN SAVE RST （共 8 个）
     """
     try:
         canvas.draw_string(8, 4, line1, image.COLOR_YELLOW, 3)
@@ -1056,6 +1056,11 @@ class Mission:
 
     分工：相机是眼睛，主控是手。相机只报"该盯谁、到位没有"，
     夹爪动作由主控执行，做完发 CMD_NEXT，这里才推进。
+
+    ⚠️ v4 起协议的架构改成"主控做流程"，这套状态机**默认不启用**，
+    只有命令行加 --mission 才会跑，而且只驱动本地屏幕叠加层/日志，
+    不再往串口帧里塞阶段号（v4 没有那个字段）。保留它是因为：
+    规则理解、本地演示、以及单元测试都还靠它。
     """
 
     def __init__(self, order=("red", "green", "blue"),
@@ -1579,8 +1584,10 @@ def main(argv=None):
             print("[INFO] 车上物料位置(%d,%d) 半径 %d 内的同色目标会被忽略"
                   % (mission.hold_point[0], mission.hold_point[1],
                      mission.hold_ignore_n))
-        print("[INFO] 分工：相机只报「该看谁、到位没有」；"
-              "夹爪动作由主控做，完成后发 CMD_NEXT(0x05) 推进")
+        # 注意：v4 协议里没有状态字段，也没有 NEXT 指令。这套状态机现在
+        # 只在本地演示（屏幕叠加层 + 日志）时有用，不会出现在串口帧里。
+        print("[INFO] 本地演示模式：状态机只驱动屏幕叠加层，"
+              "串口上报的仍是 v4 的「一个目标 + 环/块标志」")
 
     # ---- 显示：待机/运行状态 ----
     standby = False
@@ -1678,9 +1685,14 @@ def main(argv=None):
                     order2 = parse_task_code(ui.code_buf)
                     if order2:
                         task_code = ui.code_buf
-                        mission = make_mission(order2)
+                        # 任务码现在**只用于屏幕显示**（规则里值 5 分）。
+                        # v4 由主控负责流程，所以这里不能顺手把本地状态机打开
+                        # —— 否则屏幕上会开始显示"对准物料/可放置"，而串口帧
+                        # 里根本没有这些信息，现场会彻底对不上。
+                        if mission is not None:
+                            mission = make_mission(order2)   # 只有 --mission 时才重建
                         say("CODE %s OK" % task_code)
-                        print("[UI] 任务码 -> %s" % task_code)
+                        print("[UI] 任务码 -> %s（仅显示）" % task_code)
                     else:
                         say("BAD CODE")
                 else:
@@ -1995,8 +2007,12 @@ def main(argv=None):
                 line1 = "%s  %s" % (color_name.upper(),
                                     "STANDBY" if standby else "RUN")
                 if info:
-                    line2 = "xn=%d yn=%d wn=%d hn=%d" % (info["x_n"], info["y_n"],
-                                                         info["w_n"], info["h_n"])
+                    # v4：info 里是分析分辨率下的像素值（x/y 是左上角，cx/cy 是中心）。
+                    # 屏幕上只画"中心/尺寸"就够了，别再把归一化的 x_n 捞出来（已经没有这个键）。
+                    line2 = "%s cx=%d cy=%d %dx%d" % (
+                        "RING" if info.get("is_ring") else "BLOCK",
+                        int(info["cx"]), int(info["cy"]),
+                        int(info["w"]), int(info["h"]))
                 else:
                     line2 = "NO TARGET"
 
@@ -2005,7 +2021,7 @@ def main(argv=None):
             if ui is None:
                 img.draw_string(4, 4, line1, image.COLOR_WHITE, 2)
                 img.draw_string(4, 30, line2, image.COLOR_WHITE, 1)
-                img.draw_string(4, 52, "fps=%.1f seq=%d" % (fps_now, seq),
+                img.draw_string(4, 52, "fps=%.1f" % fps_now,
                                 image.COLOR_WHITE, 1)
 
                 # 任务码显示：比赛规则要求"显示任务"（5 分），
@@ -2100,9 +2116,14 @@ def main(argv=None):
                          ",".join(sorted(mission.done)) or "-",
                          rx_bytes, rx_frames))
             elif info:
-                print("[RUN] %.1ffps seq=%d 命中 xn=%d yn=%d wn=%d hn=%d 像素=(%d,%d %dx%d) rx=%dB/%df"
-                      % (fps_now, seq, info["x_n"], info["y_n"], info["w_n"], info["h_n"],
-                         info["x"], info["y"], info["w"], info["h"], rx_bytes, rx_frames))
+                # v4：日志里打的是"分析分辨率下的像素"，协议帧里另外换算成 640x480。
+                print("[RUN] %.1ffps %s cx=%d cy=%d %dx%d (左上角 %d,%d) rx=%dB/%df"
+                      % (fps_now,
+                         "环" if info.get("is_ring") else "块",
+                         int(info["cx"]), int(info["cy"]),
+                         int(info["w"]), int(info["h"]),
+                         int(info["x"]), int(info["y"]),
+                         rx_bytes, rx_frames))
             else:
                 print("[RUN] %.1ffps seq=%d 未检测到目标 rx=%dB/%df"
                       % (fps_now, seq, rx_bytes, rx_frames))
