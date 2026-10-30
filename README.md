@@ -39,6 +39,8 @@ E:\maxican\
 │   ├─ serial_monitor.py                上位机命令行版（CH340 联调用）
 │   ├─ serial_capture.ps1               不依赖 pyserial 的串口抓包（.NET 串口）
 │   ├─ field_test.ps1                   **现场一键工具**（部署/运行/拉图/改配置/重启）
+│   ├─ mobile\index.html                **手机端页面**（浏览器打开，不用装 App）
+│   ├─ watch_ports.py                   盯串口插拔并自检能否写入
 │   └─ make_ring_test.py                生成环/块标准色图（给 vision_selftest 用）
 ├─ stm32\
 │   ├─ mx_protocol.h                    主控侧协议接口（纯 C，不依赖 HAL）
@@ -307,6 +309,54 @@ python pc\serial_monitor.py --simulate --duration 5
 结束时打印累计帧数、无目标帧数、色环/色块数、校验失败数。
 
 ---
+
+## 4.3 手机端（浏览器打开，不用装 App）
+
+现场不想带笔记本时，用手机看画面、发选色指令。**不需要装 APK**——手机浏览器打开一个
+网页就行，页面是 pc/mobile/index.html（Material You 深色、大按钮、横竖屏自适应）。
+
+相机端跑一个 100 行的 HTTP 小服务（camera/net_server.py，纯标准库）：
+
+`sh
+# 相机上：开手机页面（端口 8000）
+python3 /root/maixcam_color_tracker.py --net 8000
+# 或者写进配置，开机自启就带：配置里加 net: 8000
+`
+
+手机和相机在同一网络时，浏览器打开 http://<相机IP>:8000。
+
+### 两种“同一网络”的做法
+
+**A. 相机自己发热点（推荐，现场不需要路由器）**
+
+`sh
+sh /root/wifi_ap.sh start        # 手机连 MaixCAM / maixcam888
+sh /root/wifi_ap.sh status       # 看状态、看连了几台设备
+sh /root/wifi_ap.sh stop         # 关掉，恢复 WiFi 客户端模式
+`
+
+手机连上 MaixCAM（密码 maixcam888）后打开 **http://192.168.4.1:8000**。
+
+> ⚠️ 实测踩坑：**不要** 在相机上执行 ip link set wlan0 down，aic8800 驱动会卡在
+> D 状态，之后 ps 永久阻塞、SSH 在 banner 阶段超时，只能断电重启。脚本里已经
+> 避开这个操作（用 wpa_cli terminate 代替 killall wpa_supplicant）。
+
+**B. 手机开热点，相机连过去**
+
+手机开热点 → 相机连上后拿到 IP → 手机浏览器打开 http://<相机IP>:8000。
+相机连 WiFi 可以用 MaixPy 的 
+etwork 模块，或 wpa_cli。
+
+### 页面能做什么
+
+| 区域 | 内容 |
+| --- | --- |
+| 顶栏 | 连接状态、帧率 |
+| 画面 | 640×480 参考系的等比视口，目标框 + 轨迹 + 中心十字 |
+| 目标卡 | 有目标/无目标、颜色、**色环还是色块**、中心、尺寸 |
+| 底部 | 红/绿/蓝大按钮（发选色指令）、PING、录制 |
+
+![手机端](doc/手机上位机.png)
 
 ## 5. 接入 STM32
 
