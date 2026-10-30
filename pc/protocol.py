@@ -1,48 +1,57 @@
 """
-相机 <-> 主控 串口协议 v2.0 —— 纯逻辑实现（不依赖串口库、不依赖硬件）
+相机 <-> 主控 串口协议（v4：与组内《相机_主控串口通信协议.docx》字节级一致）
+=========================================================================
 
-对应文档：相机_主控串口通信协议_定稿.md
+这份实现以那份文档为**唯一基准**。文档里的示例帧直接作为黄金向量写进了
+tests/test_protocol.py，任何改动导致它不匹配都会立刻失败。
 
-上行（相机 -> 主控）：17 字节定长
-    0-3   帧头 AA AA BB BB
-    4     帧序号 seq (0-255 循环)
-    5     目标是否存在 01/00
-    6     目标颜色 01红 02绿 03蓝
-    7     旋转角度（圆柱物块恒 00）
-    8     x_n   0-255 横向相对位置，中心约 128
-    9     y_n   0-255 纵向相对位置，中心约 128
-    10    w_n   0-255 长边 / 画面宽 * 255
-    11    h_n   0-255 短边 / 画面宽 * 255
-    12    校验和 = 偏移 4-11 共 8 字节累加 & 0xFF
-    13-16 帧尾 FF FF EE EE
+上行（相机 -> 主控）：20 字节定长
+    0-3    帧头 AA AA BB BB
+    4      目标是否存在   0x01 存在 / 0x00 不存在
+    5      目标颜色       0x01 红 / 0x02 绿 / 0x03 蓝
+    6      旋转角度       0-255 表示 0-360 度（圆柱没有旋转概念，见下面的扩展）
+    7-8    中心 x         uint16 小端，像素
+    9-10   中心 y         uint16 小端，像素
+    11-12  目标长 w       uint16 小端，像素
+    13-14  目标宽 h       uint16 小端，像素
+    15     校验和         偏移 4-14 共 11 字节累加，取低 8 位
+    16-19  帧尾 FF FF EE EE
 
-下行（主控 -> 相机）：11 字节定长
-    0-3   帧头 CC CC DD DD
-    4     命令字 CMD
-    5     参数 ARG
-    6     校验和 = (CMD + ARG) & 0xFF
-    7-10  帧尾 FF FF EE EE
+    ★ 扩展（不影响文档解析器）：第 6 字节的 **bit7 用作"是不是色环"标志**，
+      低 7 位才是角度。文档本身就写了"圆柱形物块没有旋转角度的概念，
+      但我们仍然保留"——这个字节空着浪费，正好拿来传环/块。
+      照着文档写的解析器读到的只是一个无意义的旋转值，不会出错。
+      角度的映射：低 7 位 0-127 对应 0-360 度。
 
-回执（相机 -> 主控）：11 字节定长
-    4     回执命令字 = CMD + 0x80
-    5     状态 00 成功 / 01 失败
-    6     校验和 = (回执命令字 + 状态) & 0xFF
+下行（主控 -> 相机）：4 字节定长，**无校验和**
+    0-1    帧头 AA BB
+    2      指令 0x01 识别红色 / 0x02 绿色 / 0x03 蓝色
+           ★ 扩展 0x7F = PING（调试用，立刻回一帧；主控不需要发）
+    3      帧尾 FF
+
+    文档原文："一旦接收到一帧指令之后就按照这个指令一直识别下去。"
+    也就是说相机记住这个颜色，一直发，直到收到下一条指令。
+
+坐标基准：**固定按 640x480 换算**。相机如果在内部用 320x240 之类更低的分辨率
+做识别（为了提帧率），送出去的坐标也要换算回 640x480 的参考系，这样主控那边
+的坐标含义永远不变。
+
+注意：本协议**没有帧序号**，所以无法用序号推算丢帧，只能看每秒实际收到多少帧。
 """
 
 from __future__ import annotations
 
-from typing import Dict, Iterator, List, Optional
+from typing import Dict, List, Optional
 
 # ---------------------------------------------------------------- 常量
 
 UP_HEADER = b"\xAA\xAA\xBB\xBB"
 UP_TAIL = b"\xFF\xFF\xEE\xEE"
-UP_FRAME_LEN = 17
+UP_FRAME_LEN = 20
 
-DOWN_HEADER = b"\xCC\xCC\xDD\xDD"
-DOWN_TAIL = b"\xFF\xFF\xEE\xEE"
-DOWN_FRAME_LEN = 11
-ACK_CMD_OFFSET = 0x80
+DOWN_HEADER = b"\xAA\xBB"
+DOWN_TAIL = b"\xFF"
+DOWN_FRAME_LEN = 4
 
 COLOR_RED = 0x01
 COLOR_GREEN = 0x02
@@ -51,170 +60,185 @@ COLOR_BLUE = 0x03
 COLOR_NAMES = {COLOR_RED: "red", COLOR_GREEN: "green", COLOR_BLUE: "blue"}
 COLOR_VALUES = {v: k for k, v in COLOR_NAMES.items()}
 
-CMD_SET_COLOR = 0x01
-CMD_RUN_STANDBY = 0x02
-CMD_SET_FPS = 0x03
-CMD_CALIBRATE = 0x04
-CMD_NEXT = 0x05      # v3.0：主控"已执行完当前动作"
-CMD_ABORT = 0x06     # v3.0：主控放弃本次任务
-CMD_SAVE = 0x10
+# 下行指令：1/2/3 与颜色号同值，另有调试用的 PING
+CMD_RED = 0x01
+CMD_GREEN = 0x02
+CMD_BLUE = 0x03
 CMD_PING = 0x7F
 
 CMD_NAMES = {
-    CMD_SET_COLOR: "SET_COLOR",
-    CMD_RUN_STANDBY: "RUN/STANDBY",
-    CMD_SET_FPS: "SET_FPS",
-    CMD_CALIBRATE: "CALIBRATE",
-    CMD_NEXT: "NEXT",
-    CMD_ABORT: "ABORT",
-    CMD_SAVE: "SAVE",
+    CMD_RED: "TRACK_RED",
+    CMD_GREEN: "TRACK_GREEN",
+    CMD_BLUE: "TRACK_BLUE",
     CMD_PING: "PING",
 }
 
-# v3.0 上行 state 字段：相机现在处于哪个任务阶段
-STATE_SEARCH = 0
-STATE_MATERIAL = 1
-STATE_GRAB = 2
-STATE_DEST = 3
-STATE_DROP = 4
-STATE_DONE = 5
+VALID_CMDS = set(CMD_NAMES)
 
-STATE_NAMES = {
-    STATE_SEARCH: "搜索",
-    STATE_MATERIAL: "对准物料",
-    STATE_GRAB: "可抓取",
-    STATE_DEST: "对准目标区",
-    STATE_DROP: "可放置",
-    STATE_DONE: "完成",
-}
+# 第 6 字节：bit7 = 色环标志，低 7 位 = 角度
+RING_BIT = 0x80
+ANGLE_MASK = 0x7F
+ANGLE_STEPS = 127          # 低 7 位最大 127，对应 360 度
 
-STATUS_OK = 0x00
-STATUS_FAIL = 0x01
+# 坐标参考系
+REF_W = 640
+REF_H = 480
 
-# 上行帧字段在整帧中的偏移
-OFF_SEQ = 4
-OFF_EXISTS = 5
-OFF_COLOR = 6
-OFF_STATE = 7          # v3.0：原 rotation，现在表示任务阶段
-OFF_XN = 8
-OFF_YN = 9
-OFF_WN = 10
-OFF_HN = 11
-OFF_CHECKSUM = 12
+# 偏移
+OFF_EXISTS = 4
+OFF_COLOR = 5
+OFF_ROTATION = 6
+OFF_X = 7
+OFF_Y = 9
+OFF_W = 11
+OFF_H = 13
+OFF_CHECKSUM = 15
 
-# 校验和覆盖范围：偏移 4-11，共 8 字节
-SUM_START = OFF_SEQ
-SUM_END = OFF_HN  # 含
-
-# 归一化中心理论值
-CENTER_N = 128
+# 校验和覆盖：偏移 4-14，共 11 字节
+SUM_START = OFF_EXISTS
+# 注意：h 占偏移 13-14，所以"结束（不含）"是 15，也就是校验和字节本身的位置。
+# 这里不能写 OFF_H + 1（=14，会少算 h 的高字节 1 个字节）。
+SUM_END = OFF_CHECKSUM
+SUM_LEN = SUM_END - SUM_START      # 11
 
 
 # ---------------------------------------------------------------- 校验和
 
-def uplink_checksum(payload: bytes) -> int:
-    """payload 为偏移 4-11 的 8 字节。"""
-    if len(payload) != SUM_END - SUM_START + 1:
-        raise ValueError(f"payload 必须为 8 字节，实际 {len(payload)}")
-    return sum(payload) & 0xFF
+def uplink_checksum(payload11: bytes) -> int:
+    """payload 为偏移 4-14 的 11 字节。"""
+    if len(payload11) != SUM_LEN:
+        raise ValueError("payload 必须为 %d 字节，实际 %d" % (SUM_LEN, len(payload11)))
+    return sum(payload11) & 0xFF
 
 
-def downlink_checksum(cmd: int, arg: int) -> int:
-    return (cmd + arg) & 0xFF
+# ---------------------------------------------------------------- 角度/环
+
+def encode_rotation(angle_deg: float = 0.0, is_ring: bool = False) -> int:
+    """把"角度 + 是否色环"压进第 6 字节。"""
+    a = int(round(float(angle_deg) * ANGLE_STEPS / 360.0))
+    a = 0 if a < 0 else (ANGLE_STEPS if a > ANGLE_STEPS else a)
+    return (RING_BIT if is_ring else 0) | (a & ANGLE_MASK)
+
+
+def decode_rotation(byte: int):
+    """拆开第 6 字节，返回 (角度, 是否色环)。"""
+    return ((byte & ANGLE_MASK) * 360.0 / ANGLE_STEPS, bool(byte & RING_BIT))
+
+
+# ---------------------------------------------------------------- 坐标换算
+
+def to_ref(x, y, w, h, img_w, img_h):
+    """把任意分辨率下的像素框换算到 640x480 参考系（四舍五入，截断到 0-65535）。"""
+    def sc(v, src, dst):
+        if src <= 0:
+            return 0
+        n = int(round(v * float(dst) / src))
+        return 0 if n < 0 else (65535 if n > 65535 else n)
+    return (sc(x, img_w, REF_W), sc(y, img_h, REF_H),
+            sc(w, img_w, REF_W), sc(h, img_w, REF_W))
+
+
+def _u8(v, name):
+    if not 0 <= int(v) <= 0xFF:
+        raise ValueError("%s 超出 uint8 范围: %s" % (name, v))
+    return int(v)
+
+
+def _u16(v, name):
+    if not 0 <= int(v) <= 0xFFFF:
+        raise ValueError("%s 超出 uint16 范围: %s" % (name, v))
+    return int(v)
 
 
 # ---------------------------------------------------------------- 组帧
 
-def _u8(v: int, name: str) -> int:
-    if not 0 <= int(v) <= 0xFF:
-        raise ValueError(f"{name} 超出 uint8 范围: {v}")
-    return int(v)
-
-
-def build_uplink(
-    seq: int,
-    exists: int,
-    color: int,
-    state: int = 0,
-    x_n: int = 0,
-    y_n: int = 0,
-    w_n: int = 0,
-    h_n: int = 0,
-) -> bytes:
-    """组一帧上行数据。exists=0 时坐标字段应全为 0。"""
-    payload = bytes(
-        [
-            _u8(seq, "seq"),
-            _u8(exists, "exists"),
-            _u8(color, "color"),
-            _u8(state, "state"),
-            _u8(x_n, "x_n"),
-            _u8(y_n, "y_n"),
-            _u8(w_n, "w_n"),
-            _u8(h_n, "h_n"),
-        ]
-    )
+def build_uplink(exists: int, color: int, rotation: int = 0,
+                 x: int = 0, y: int = 0, w: int = 0, h: int = 0) -> bytes:
+    """组一帧上行数据。exists=0 时坐标字段应为 0。"""
+    payload = bytes([
+        _u8(exists, "exists"),
+        _u8(color, "color"),
+        _u8(rotation, "rotation"),
+        _u16(x, "x") & 0xFF, (_u16(x, "x") >> 8) & 0xFF,
+        _u16(y, "y") & 0xFF, (_u16(y, "y") >> 8) & 0xFF,
+        _u16(w, "w") & 0xFF, (_u16(w, "w") >> 8) & 0xFF,
+        _u16(h, "h") & 0xFF, (_u16(h, "h") >> 8) & 0xFF,
+    ])
     return UP_HEADER + payload + bytes([uplink_checksum(payload)]) + UP_TAIL
 
 
-def build_downlink(cmd: int, arg: int = 0x00) -> bytes:
+def build_uplink_for_blob(exists: int, color: int, blob,
+                          img_w: int, img_h: int, is_ring: bool = False,
+                          angle_deg: float = 0.0) -> bytes:
+    """从 MaixPy 风格的 blob（x, y, w, h）直接组帧，自动换算到 640x480 参考系。
+
+    blob 为 None 或 exists=0 时，坐标全 0。
+    """
+    rot = encode_rotation(angle_deg, is_ring)
+    if not exists or blob is None:
+        return build_uplink(0, color, rot, 0, 0, 0, 0)
+    bx, by, bw, bh = blob[0], blob[1], blob[2], blob[3]
+    cx = bx + bw / 2.0
+    cy = by + bh / 2.0
+    rx, ry, rw, rh = to_ref(cx, cy, bw, bh, img_w, img_h)
+    return build_uplink(1, color, rot, rx, ry, rw, rh)
+
+
+def build_downlink(cmd: int) -> bytes:
     cmd = _u8(cmd, "cmd")
-    arg = _u8(arg, "arg")
-    return DOWN_HEADER + bytes([cmd, arg, downlink_checksum(cmd, arg)]) + DOWN_TAIL
-
-
-def build_ack(cmd: int, status: int = STATUS_OK) -> bytes:
-    ack_cmd = (_u8(cmd, "cmd") + ACK_CMD_OFFSET) & 0xFF
-    status = _u8(status, "status")
-    return DOWN_HEADER + bytes([ack_cmd, status, downlink_checksum(ack_cmd, status)]) + DOWN_TAIL
+    if cmd not in VALID_CMDS:
+        raise ValueError("未知指令 0x%02X" % cmd)
+    return DOWN_HEADER + bytes([cmd]) + DOWN_TAIL
 
 
 # ---------------------------------------------------------------- 解帧
 
 def parse_uplink(frame: bytes) -> Optional[Dict]:
-    """解析一帧完整的上行数据（必须正好 17 字节）。失败返回 None。"""
+    """解析一帧完整的上行数据（必须正好 20 字节）。失败返回 None。"""
     if len(frame) != UP_FRAME_LEN:
         return None
-    if frame[0:4] != UP_HEADER or frame[13:17] != UP_TAIL:
+    if frame[0:4] != UP_HEADER or frame[16:20] != UP_TAIL:
         return None
-    payload = frame[SUM_START:SUM_END + 1]
+    payload = frame[SUM_START:SUM_END]
     if uplink_checksum(payload) != frame[OFF_CHECKSUM]:
         return None
-    x_n, y_n = frame[OFF_XN], frame[OFF_YN]
-    w_n, h_n = frame[OFF_WN], frame[OFF_HN]
-    exists = frame[OFF_EXISTS]
+
+    x = frame[OFF_X] | (frame[OFF_X + 1] << 8)
+    y = frame[OFF_Y] | (frame[OFF_Y + 1] << 8)
+    w = frame[OFF_W] | (frame[OFF_W + 1] << 8)
+    h = frame[OFF_H] | (frame[OFF_H + 1] << 8)
+    angle, is_ring = decode_rotation(frame[OFF_ROTATION])
     return {
-        "seq": frame[OFF_SEQ],
-        "exists": exists,
+        "exists": frame[OFF_EXISTS],
         "color": frame[OFF_COLOR],
         "color_name": COLOR_NAMES.get(frame[OFF_COLOR], "?"),
-        "state": frame[OFF_STATE],
-        "x_n": x_n,
-        "y_n": y_n,
-        "w_n": w_n,
-        "h_n": h_n,
-        "dx": x_n - CENTER_N,
-        "dy": y_n - CENTER_N,
-        "area_n": w_n * h_n,
+        "rotation": frame[OFF_ROTATION],
+        "angle_deg": angle,
+        "is_ring": is_ring,
+        "x": x, "y": y, "w": w, "h": h,
+        "cx": x, "cy": y,          # 第 7 字节起就是**中心**坐标，不是左上角
         "raw": bytes(frame),
     }
 
 
 def parse_downlink(frame: bytes) -> Optional[Dict]:
-    """解析一帧完整的下行指令或回执（必须正好 11 字节）。失败返回 None。"""
+    """解析一帧完整的下行指令（必须正好 4 字节）。失败返回 None。"""
     if len(frame) != DOWN_FRAME_LEN:
         return None
-    if frame[0:4] != DOWN_HEADER or frame[7:11] != DOWN_TAIL:
+    if frame[0:2] != DOWN_HEADER or frame[3:4] != DOWN_TAIL:
         return None
-    cmd, arg = frame[4], frame[5]
-    if downlink_checksum(cmd, arg) != frame[6]:
+    cmd = frame[2]
+    if cmd not in VALID_CMDS:
         return None
+    # 注意：color 给的是**颜色名字符串**（"red"/"green"/"blue"），不是数字。
+    # 和相机端 parse_downlink() 保持一致，省得调用方到处做两次映射。
+    # PING 不是颜色指令，color 为 None。
+    color_name = COLOR_NAMES.get(cmd) if cmd in (CMD_RED, CMD_GREEN, CMD_BLUE) else None
     return {
         "cmd": cmd,
-        "arg": arg,
-        "is_ack": bool(cmd & ACK_CMD_OFFSET),
-        "ack_of": cmd & ~ACK_CMD_OFFSET,
-        "cmd_name": CMD_NAMES.get(cmd & ~ACK_CMD_OFFSET, "?"),
+        "cmd_name": CMD_NAMES[cmd],
+        "color": color_name,
+        "color_code": cmd if color_name else 0,
         "raw": bytes(frame),
     }
 
@@ -224,23 +248,20 @@ def parse_downlink(frame: bytes) -> Optional[Dict]:
 class _StreamParser:
     """按字节喂入，自动处理粘包 / 拆包 / 校验失败后重新同步。"""
 
-    def __init__(self, header: bytes, tail: bytes, frame_len: int, parser, sum_start: int, sum_end: int):
+    def __init__(self, header: bytes, tail: bytes, frame_len: int, parser):
         self._header = header
         self._tail = tail
         self._len = frame_len
         self._parser = parser
-        self._sum_start = sum_start
-        self._sum_end = sum_end
         self.buf = bytearray()
-        self.bad_frames = 0  # 帧尾或校验和不合法的次数
+        self.bad_frames = 0
 
     def feed(self, data: bytes) -> List[Dict]:
-        out: List[Dict] = []
+        out = []
         self.buf.extend(data)
         while True:
             i = self.buf.find(self._header)
             if i < 0:
-                # 只保留可能是帧头前缀的尾巴
                 keep = len(self._header) - 1
                 if len(self.buf) > keep:
                     del self.buf[: len(self.buf) - keep]
@@ -253,7 +274,7 @@ class _StreamParser:
             parsed = self._parser(frame)
             if parsed is None:
                 self.bad_frames += 1
-                del self.buf[:1]  # 丢掉一个字节重新找帧头
+                del self.buf[:1]
                 continue
             out.append(parsed)
             del self.buf[: self._len]
@@ -264,101 +285,38 @@ class UplinkParser(_StreamParser):
     """主控 / 上位机侧：解析相机发来的上行帧。"""
 
     def __init__(self):
-        super().__init__(UP_HEADER, UP_TAIL, UP_FRAME_LEN, parse_uplink, SUM_START, SUM_END)
+        super().__init__(UP_HEADER, UP_TAIL, UP_FRAME_LEN, parse_uplink)
 
 
 class DownlinkParser(_StreamParser):
     """相机侧：解析主控发来的下行指令。"""
 
     def __init__(self):
-        super().__init__(DOWN_HEADER, DOWN_TAIL, DOWN_FRAME_LEN, parse_downlink, 4, 5)
+        super().__init__(DOWN_HEADER, DOWN_TAIL, DOWN_FRAME_LEN, parse_downlink)
 
 
-class MixedParser:
-    """上位机侧：同时处理「上行数据帧(AAAA/17B)」和「相机回执帧(CCCC/11B)」。
+# ---------------------------------------------------------------- 统计辅助
 
-    为什么需要它：相机每收到一条下行命令都会立刻回一帧 11 字节回执，
-    而回执和 17 字节的数据帧走的是**同一根 TX 线**。只认 AAAA 的
-    UplinkParser 会把这 11 字节当垃圾吞掉（看不到命令到底成功没有），
-    只认 CCCC 的又看不到数据。所以这里按「哪个帧头先出现」分派。
-
-    返回的每个 dict 都带 kind = "uplink" / "downlink"。
-    """
-
-    def __init__(self):
-        self.buf = bytearray()
-        self.bad_frames = 0
-        self.uplink_count = 0
-        self.downlink_count = 0
-
-    def feed(self, data: bytes) -> List[Dict]:
-        out: List[Dict] = []
-        self.buf.extend(data)
-        while True:
-            i_up = self.buf.find(UP_HEADER)
-            i_dn = self.buf.find(DOWN_HEADER)
-
-            if i_up < 0 and i_dn < 0:
-                # 两个头都没有：只保留可能是帧头前缀的尾巴
-                if len(self.buf) > 3:
-                    del self.buf[: len(self.buf) - 3]
-                break
-
-            if i_dn < 0 or (0 <= i_up < i_dn):
-                idx, frame_len, parser, kind = i_up, UP_FRAME_LEN, parse_uplink, "uplink"
-            else:
-                idx, frame_len, parser, kind = i_dn, DOWN_FRAME_LEN, parse_downlink, "downlink"
-
-            if idx > 0:
-                del self.buf[:idx]
-            if len(self.buf) < frame_len:
-                break
-
-            frame = bytes(self.buf[:frame_len])
-            parsed = parser(frame)
-            if parsed is None:
-                self.bad_frames += 1
-                del self.buf[:1]          # 丢掉一个字节重新找帧头
-                continue
-
-            parsed["kind"] = kind
-            if kind == "uplink":
-                self.uplink_count += 1
-            else:
-                self.downlink_count += 1
-            out.append(parsed)
-            del self.buf[:frame_len]
-        return out
-
-
-# ---------------------------------------------------------------- 归一化
-
-def norm255(value: float, total: float) -> int:
-    """把像素量换算成 0-255 的归一化值（四舍五入，越界截断）。"""
-    if total <= 0:
-        return 0
-    n = int(value * 255.0 / total + 0.5)
-    return 0 if n < 0 else (255 if n > 255 else n)
-
-
-def seq_gap(prev: Optional[int], cur: int) -> int:
-    """返回两帧之间的丢帧数（0 表示连续）。prev 为 None 时返回 0。"""
-    if prev is None:
-        return 0
-    return (cur - prev - 1) & 0xFF
+def frame_rate(timestamps: List[float]):
+    """给一串到达时间算帧率和间隔统计（没有序号，只能靠时间）。"""
+    if len(timestamps) < 2:
+        return 0.0, 0.0, 0.0, 0.0
+    gaps = [(b - a) * 1000.0 for a, b in zip(timestamps, timestamps[1:])]
+    span = timestamps[-1] - timestamps[0]
+    fps = (len(timestamps) - 1) / span if span > 0 else 0.0
+    return fps, min(gaps), sum(gaps) / len(gaps), max(gaps)
 
 
 __all__ = [
-    "UP_FRAME_LEN", "DOWN_FRAME_LEN", "CENTER_N",
+    "UP_HEADER", "UP_TAIL", "UP_FRAME_LEN",
+    "DOWN_HEADER", "DOWN_TAIL", "DOWN_FRAME_LEN",
     "COLOR_RED", "COLOR_GREEN", "COLOR_BLUE", "COLOR_NAMES", "COLOR_VALUES",
-    "CMD_SET_COLOR", "CMD_RUN_STANDBY", "CMD_SET_FPS", "CMD_CALIBRATE",
-    "CMD_NEXT", "CMD_ABORT", "CMD_SAVE", "CMD_PING", "CMD_NAMES",
-    "STATE_SEARCH", "STATE_MATERIAL", "STATE_GRAB",
-    "STATE_DEST", "STATE_DROP", "STATE_DONE", "STATE_NAMES",
-    "STATUS_OK", "STATUS_FAIL",
-    "uplink_checksum", "downlink_checksum",
-    "build_uplink", "build_downlink", "build_ack",
+    "CMD_RED", "CMD_GREEN", "CMD_BLUE", "CMD_PING", "CMD_NAMES", "VALID_CMDS",
+    "RING_BIT", "ANGLE_MASK", "REF_W", "REF_H",
+    "OFF_EXISTS", "OFF_COLOR", "OFF_ROTATION", "OFF_X", "OFF_Y",
+    "OFF_W", "OFF_H", "OFF_CHECKSUM", "SUM_START", "SUM_END", "SUM_LEN",
+    "uplink_checksum", "encode_rotation", "decode_rotation", "to_ref",
+    "build_uplink", "build_uplink_for_blob", "build_downlink",
     "parse_uplink", "parse_downlink",
-    "UplinkParser", "DownlinkParser", "MixedParser",
-    "norm255", "seq_gap",
+    "UplinkParser", "DownlinkParser", "frame_rate",
 ]

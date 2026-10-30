@@ -192,9 +192,13 @@ def test_mission_on_real_scan():
         d = m.update(objs)
     check(d["state"] == CAM.STATE_GRAB, "正中且够大应可抓取，得到 %s",
           CAM.STATE_TEXT.get(d["state"]))
-    frame, _ = CAM.frame_from_object(7, d["target"], d["state"], d["color"])
-    check(frame[7] == CAM.STATE_GRAB, "上行帧的 state 字段应是可抓取")
-    check(frame[12] == sum(frame[4:12]) & 0xFF, "上行帧校验和错误")
+    # v4：上行帧里没有 state 了，只有"目标 + 环/块标志"。
+    # 状态机（d["state"]）现在只用于本地叠加层/日志。
+    frame, _ = CAM.frame_from_object(d["target"], d["color"], W, H)
+    check(len(frame) == 20, "v4 上行帧长应为 20，得到 %d", len(frame))
+    check(frame[4] == 1, "有目标时 exists 应为 1")
+    check(frame[16:20] == b"\xFF\xFF\xEE\xEE", "帧尾错误")
+    check(frame[15] == sum(frame[4:15]) & 0xFF, "上行帧校验和错误（应覆盖 4-14）")
 
     m.advance()
 
@@ -298,30 +302,6 @@ def test_learn_rejects():
     check("PALE" in note, "应提示太淡，得到 %s", note)
 
 
-def test_measure_center_target():
-    section("G-SZ/D-SZ：在动作点量 grab_w_n，量完必须判得了「到位」")
-    L, A, B = FC.blank(W, H)
-    FC.draw_rect(L, A, B, 140, 100, 40, 40, FC.lab_red())
-    sim = image(L, A, B)
-    wn, note = CAM.measure_center_target(sim, W, H)
-    check(wn is not None, "应量出宽度，得到 %s (%s)", wn, note)
-    check(wn == 30, "40px/320*255*0.95 应≈30，得到 %s", wn)
-
-    objs = CAM.scan_objects(sim, W, H)
-    o = objs[0]
-    check(o["w_n"] >= wn, "量出的门槛必须能让目标判为到位：%d vs %s",
-          o["w_n"], wn)
-    check(CAM.is_aligned(o, (128, 128), 40, wn), "标定后应判为已到位")
-    # 这条是现场"卡在对准物料"的回归：占位值 90 在这个尺度下永远不成立
-    check(not CAM.is_aligned(o, (128, 128), 40, 90),
-          "占位值 90 不该成立（否则这个测试没意义）")
-
-    L, A, B = FC.blank(W, H)
-    wn2, note2 = CAM.measure_center_target(image(L, A, B), W, H)
-    check(wn2 is None and "NO TARGET" in note2, "空白画面应报没目标，得到 %s",
-          note2)
-
-
 def main():
     print("=" * 60)
     print("视觉链路仿真测试（无硬件）")
@@ -338,7 +318,6 @@ def main():
     test_learn_from_center()
     test_learn_prefers_center()
     test_learn_rejects()
-    test_measure_center_target()
 
     print("\n" + "=" * 60)
     print("结果：通过 %d 项，失败 %d 项" % (_PASS, _FAIL))

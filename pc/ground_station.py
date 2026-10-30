@@ -1,19 +1,27 @@
 """
-智能搬运 · 上位机（图形界面）
-=============================
+智能搬运 · 上位机（图形界面，v4 协议）
+=====================================
 
 给 MaixCAM 相机端配的调试/演示界面。一根 USB 转串口（CH340）接相机的
-A19(TX)，就能看到相机现在盯着谁、对准了没有、离动作点还差多少像素。
+A19(TX)，就能看到相机现在盯着谁、目标在画面里的哪个位置、多大。
 
-它能干的事：
-    · 选串口、连接、实时显示帧率 / 丢帧 / 坏帧
-    · 把归一化坐标还原成画面框，实时画出来（按颜色上色，带轨迹）
-    · 显示状态机当前阶段、目标颜色、四个坐标字段的原始值
-    · 下发全部下行命令：NEXT / ABORT / PING / RUN / STANDBY /
-      SET_COLOR / SET_FPS / CALIBRATE / SAVE
-    · 收到相机的回执就在日志里标 OK / FAIL —— 命令到底成功没有，一眼可见
+v4 与旧版（v3）的差别决定了这个界面长什么样：
+    · 上行 20 字节：x/y 是目标**中心**像素，坐标系固定 640x480，
+      所以画布按 640x480 等比缩放画框，而不再有"归一化坐标"这回事；
+    · 第 6 字节 bit7 = 色环标志，低 7 位 = 角度，用 decode_rotation() 拆；
+    · **没有帧序号** —— 丢帧统计从原理上就不成立，界面里不再显示；
+    · **没有任务阶段**（可抓取/可放置这些是 v3 主控状态机的概念，v4 相机
+      不负责，所以整块删掉）；
+    · **没有回执帧** —— 命令发出去之后相机不会回 OK/FAIL，回执面板删掉；
+    · 下行只有 4 字节：三个颜色按钮 + PING，其余命令（NEXT/ABORT/RUN/
+      SAVE/CAL/SET_FPS）都不存在了。
+
+它还能干的事：
+    · 实时显示帧率 / 坏帧 / 有无目标 / 颜色 / 环还是块 / 中心 / 尺寸
+    · 把中心坐标还原成画面框，实时画出来（按颜色上色，带轨迹）
     · 录制 CSV（离线复盘用）
     · 演示模式：没有相机也没有串口也能把界面跑起来
+    · 断流检测：超过 1 秒没帧就在画布上盖"数据过期"横幅
 
 用法：
     python ground_station.py                 打开界面，手动选串口连接
@@ -70,6 +78,7 @@ BORDER = "#2e3440"
 FG = "#d8dee9"
 FG_DIM = "#7c8698"
 CANVAS_BG = "#0b0d11"
+LETTERBOX = "#07080b"
 
 C_RED = "#ff5a5f"
 C_GREEN = "#3ddc84"
@@ -79,15 +88,10 @@ C_CYAN = "#56d4dd"
 
 COLOR_HEX = {"red": C_RED, "green": C_GREEN, "blue": C_BLUE, "?": FG_DIM}
 
-# 状态对应的强调色
-STATE_HEX = {
-    P.STATE_SEARCH: FG_DIM,
-    P.STATE_MATERIAL: C_YELLOW,
-    P.STATE_GRAB: C_GREEN,
-    P.STATE_DEST: C_CYAN,
-    P.STATE_DROP: C_BLUE,
-    P.STATE_DONE: C_GREEN,
-}
+# 形状的强调色：环用青色、块用蓝色，和颜色本身区分开（否则红环红块
+# 只看颜色分不出来）
+SHAPE_RING_HEX = C_CYAN
+SHAPE_BLOCK_HEX = C_BLUE
 
 FONT_UI = ("Microsoft YaHei UI", 9)
 FONT_UI_B = ("Microsoft YaHei UI", 9, "bold")
@@ -100,80 +104,69 @@ def hexs(data):
     return " ".join("%02X" % b for b in data)
 
 
-# ================================================================ 画面换算
-
-def norm_box(x_n, y_n, w_n, h_n, cw, ch):
-    """归一化字段 -> 画布上的 (x, y, w, h)。
-
-    注意：协议里 w_n 和 h_n **都**是按画面宽度归一化的（见协议文档），
-    所以换算高度时用的也是 cw 而不是 ch。这一点搞错的话，框会被拉高。
-    """
-    cx = x_n / 255.0 * cw
-    cy = y_n / 255.0 * ch
-    bw = w_n / 255.0 * cw
-    bh = h_n / 255.0 * cw
-    return cx - bw / 2.0, cy - bh / 2.0, bw, bh
+def shape_name(is_ring):
+    return "色环" if is_ring else "色块"
 
 
 # ================================================================ 帧统计
 
 class FrameStats:
-    """上行帧统计（纯逻辑，不碰界面 —— 可以直接单测）。
+    """v4 上行帧统计（纯逻辑，不碰界面 —— 可以直接单测）。
 
-    三件很容易做错、而且做错了会误导现场判断的事，集中在这里处理：
+    v4 没有帧序号，所以这里**没有**丢帧、丢帧率、重连次数：
+    协议里根本推不出"应该收到多少帧"，任何 lost 数字都是编的。
+    能可靠测量的只有三件事：
 
-    1. **断线不记丢帧。** 拔插 USB 或者相机重启之后，帧序号会跳一大截。
-       按序号差直接累加的话，一次重启会被记成几十上百帧丢失，
-       真正的丢帧（接线松动、波特率不对）就淹没在噪声里了。
-       所以：距上一帧超过 `resync_after` 秒才收到的第一帧算"重新同步"，
-       不计入丢帧，单独记 resyncs。
-    2. **帧率用真时间窗**（最近 1 秒实际收到多少帧），
-       而不是"总帧数 / 总时长" —— 后者在断流后会一直虚高，骗人。
-    3. **断流判定**：超过 `stale_after` 秒没有上行帧就置 stale。
+    1. **帧率用真时间窗**（最近 1 秒实际收到多少帧），而不是
+       "总帧数 / 总时长" —— 后者在断流恢复后会虚高，骗人。
+    2. **断流判定**：超过 stale_after 秒没有上行帧就置 stale。
        界面据此显示"数据过期"，而不是一直画着最后一帧装作还活着。
+    3. **分类计数**：无目标 / 色环 / 色块，方便判断相机到底认到了什么。
     """
 
-    def __init__(self, window=1.0, stale_after=1.0, resync_after=0.8):
+    def __init__(self, window=1.0, stale_after=1.0):
         self.window = window
         self.stale_after = stale_after
-        self.resync_after = resync_after
         self.reset()
 
     def reset(self):
         self.total = 0
         self.no_target = 0
-        self.lost = 0            # 真正的丢帧（序号断了，但链路一直通着）
-        self.resyncs = 0         # 断线/重启后的重新同步次数（不计入丢帧）
+        self.rings = 0
+        self.blocks = 0
         self.fps = 0.0
         self.idle = 0.0          # 距上一帧多久
         self.stale = False
         self.last_recv = None
-        self.prev_seq = None
-        self.last_state = None
+        self.last_exists = None
         self.last_color = None
+        self.last_ring = None
         self._marks = deque()
 
     def on_frame(self, now, f):
-        """喂一帧上行数据。返回 True 表示状态或颜色变了（值得记一行日志）。"""
-        if self.last_recv is not None:
-            if now - self.last_recv > self.resync_after:
-                self.resyncs += 1          # 断过线，序号不可比，别算丢帧
-            else:
-                self.lost += P.seq_gap(self.prev_seq, f["seq"])
-        self.prev_seq = f["seq"]
+        """喂一帧上行数据。返回 True 表示"值得记一行日志"的状态变了。"""
         self.last_recv = now
         self.total += 1
-        if not f["exists"]:
+        if f["exists"]:
+            if f["is_ring"]:
+                self.rings += 1
+            else:
+                self.blocks += 1
+        else:
             self.no_target += 1
 
         self._marks.append(now)
         while self._marks and now - self._marks[0] > self.window:
             self._marks.popleft()
 
-        changed = (f["state"] != self.last_state
-                   or f["color_name"] != self.last_color)
-        self.last_state = f["state"]
+        # 颜色每帧都相同，只有换了目标类型/颜色/有无才算"变化"，
+        # 否则日志会被 30 帧/秒刷爆。
+        changed = (bool(f["exists"]) != self.last_exists
+                   or f["color_name"] != self.last_color
+                   or bool(f["is_ring"]) != self.last_ring)
+        self.last_exists = bool(f["exists"])
         self.last_color = f["color_name"]
+        self.last_ring = bool(f["is_ring"])
         return changed
 
     def tick(self, now):
@@ -190,11 +183,6 @@ class FrameStats:
         # 断流时不要在界面上显示一个虚高的帧率
         self.fps = 0.0 if self.stale else float(len(self._marks)) / self.window
 
-    @property
-    def loss_pct(self):
-        denom = self.total + self.lost
-        return 100.0 * self.lost / denom if denom else 0.0
-
 
 # ================================================================ 数据源
 
@@ -206,7 +194,7 @@ class SerialLink:
     def __init__(self, port, baud=115200):
         self.port = port
         self.baud = baud
-        self.parser = P.MixedParser()
+        self.parser = P.UplinkParser()
         self._q = queue.Queue()
         self._alive = False
         self._ser = None
@@ -275,110 +263,76 @@ class SerialLink:
 
 # ---- 演示数据 ----------------------------------------------------------
 
-DEMO_PERIOD = 10.0
-
-# 演示用的关键点（归一化坐标）。数值照着现场日志的真实范围取的：
-# 物料 w_n 40~55、色环 w_n 34~40、中心 128。
-DEMO_KEYS = {
-    "far": (72, 108, 30, 62),
-    "grab": (128, 128, 52, 108),
-    "ring": (196, 168, 40, 78),
-}
-
-
-def _lerp(a, b, p):
-    return a + (b - a) * p
-
-
-def _ease(p):
-    p = 0.0 if p < 0 else (1.0 if p > 1 else p)
-    return p * p * (3.0 - 2.0 * p)
+DEMO_PERIOD = 12.0       # 一个完整演示循环的秒数
+DEMO_FPS = 25.0          # 和界面刷新节奏（40ms）差不多，队列不会越积越多
 
 
 def demo_pose(t):
-    """按时间返回 (exists, color, state, xn, yn, wn, hn)。"""
+    """按时间返回一帧要发的 v4 字段。
+
+    坐标直接是 640x480 参考系的中心像素（v4 不再归一化），场景里目标绕
+    画面中心走椭圆、尺寸周期性变化；开头 0.8 秒和中段各有一段没有目标，
+    用来演示 exists=0 的显示；后半程当成色环并带旋转角度。
+    """
     colors = ("red", "green", "blue")
-    color = colors[int(t / DEMO_PERIOD) % 3]
+    color = colors[int(t / 6.0) % 3]
     tt = t % DEMO_PERIOD
-    far, grab, ring = DEMO_KEYS["far"], DEMO_KEYS["grab"], DEMO_KEYS["ring"]
 
-    def mix(k1, k2, p):
-        p = _ease(p)
-        return tuple(_lerp(k1[i], k2[i], p) for i in range(4))
+    # 两段"没有目标"：开头还没认到，中段目标离开视野
+    if tt < 0.8 or 5.4 <= tt < 6.2:
+        return 0, color, 0.0, 0, 0, 0, 0, False
 
-    if tt < 1.6:                       # 搜索：目标在左前方晃
-        p = tt / 1.6
-        xn = far[0] + 14 * math.sin(p * 7.0)
-        yn = far[1] + 8 * math.cos(p * 5.0)
-        return 1, color, P.STATE_SEARCH, xn, yn, far[2], far[3]
-    if tt < 4.0:                       # 对准物料：往中心挪
-        return (1, color, P.STATE_MATERIAL) + mix(far, grab, (tt - 1.6) / 2.4)
-    if tt < 4.8:                       # 可抓取
-        return (1, color, P.STATE_GRAB) + grab
-    if tt < 7.0:                       # 对准目标区
-        return (1, color, P.STATE_DEST) + mix(grab, ring, (tt - 4.8) / 2.2)
-    if tt < 7.8:                       # 可放置
-        return (1, color, P.STATE_DROP) + ring
-    if tt < 9.0:                       # 完成，画面里暂时没目标
-        return 0, color, P.STATE_DONE, 0, 0, 0, 0
-    return 1, color, P.STATE_SEARCH, far[0], far[1], far[2], far[3]
+    p = (tt - 0.8) / (DEMO_PERIOD - 0.8)
+    ang = p * 2.0 * math.pi
+    cx = P.REF_W / 2.0 + math.cos(ang) * 190.0
+    cy = P.REF_H / 2.0 + math.sin(ang) * 130.0
+    w = 95.0 + 35.0 * math.sin(p * 6.0 * math.pi)
+    h = w * 0.78
+    is_ring = tt >= 6.2
+    angle = (t * 120.0) % 360.0 if is_ring else 0.0
+    return (1, color, angle, int(round(cx)), int(round(cy)),
+            int(round(w)), int(round(h)), is_ring)
 
 
 class DemoLink:
-    """演示数据源：没有相机也能把界面跑起来，接口和 SerialLink 一样。"""
+    """演示数据源：没有相机也能把界面跑起来，接口和 SerialLink 一样。
+
+    这里刻意走 P.build_uplink -> P.parse_uplink 的完整路径，而不是直接
+    拼字典 —— 演示模式顺便就在验证组帧/解帧这条真实链路。
+    """
 
     is_demo = True
 
     def __init__(self):
         self._t0 = 0.0
-        self._seq = 0
         self._next = 0.0
-        self._acks = queue.Queue()
-        self._frames = 0
         self.error = None
 
     def open(self):
         self._t0 = time.time()
-        self._next = time.time()
+        self._next = self._t0
 
     def close(self):
         pass
 
     def send(self, data):
-        d = P.parse_downlink(data)
-        if d is None:
-            return False
-        # 搬运模式下相机没有"单一追踪色"可标定，CALIBRATE 会回 FAIL —— 照实模拟
-        ok = P.STATUS_FAIL if d["cmd"] == P.CMD_CALIBRATE else P.STATUS_OK
-        ack = P.parse_downlink(P.build_ack(d["cmd"], ok))
-        self._acks.put(dict(ack, kind="downlink", demo_ok=(ok == P.STATUS_OK)))
-        return True
+        # v4 没有回执：能按 4 字节下行解析出来就说明命令合法。
+        # 返回 True 只是让界面记录"发出了"，不代表相机执行成功。
+        return P.parse_downlink(data) is not None
 
     def drain(self):
-        out = []
-        while True:
-            try:
-                out.append(self._acks.get_nowait())
-            except queue.Empty:
-                break
-
         now = time.time()
-        n = 0
-        while now >= self._next and n < 40:
-            exists, color, state, xn, yn, wn, hn = demo_pose(now - self._t0)
-            code = P.COLOR_VALUES.get(color, 1) if exists else 0
+        out = []
+        # 界面卡住时不要一次补几百帧，补一小批就够了
+        while now >= self._next and len(out) < 40:
+            exists, color, angle, cx, cy, w, h, is_ring = demo_pose(
+                now - self._t0)
             raw = P.build_uplink(
-                self._seq, 1 if exists else 0, code, state,
-                int(round(xn)), int(round(yn)),
-                int(round(wn)), int(round(hn)))
-            out.append(dict(P.parse_uplink(raw), kind="uplink"))
-            self._seq = (self._seq + 1) & 0xFF
-            self._frames += 1
-            if self._frames % 97 == 0:      # 偶尔丢一帧，让"丢帧"统计不是死的
-                self._seq = (self._seq + 1) & 0xFF
-            self._next += 1.0 / 14.0
-            n += 1
-        if n >= 40:
+                exists, P.COLOR_VALUES[color],
+                P.encode_rotation(angle, is_ring), cx, cy, w, h)
+            out.append(P.parse_uplink(raw))
+            self._next += 1.0 / DEMO_FPS
+        if len(out) >= 40:
             self._next = now
         return out
 
@@ -399,20 +353,17 @@ class GroundStation:
         # 运行时状态
         self.last = None                     # 最近一帧上行数据
         self.stats = FrameStats()
-        self.ack_ok = 0
-        self.ack_fail = 0
-        self.last_ack = None
-        self.stamp_bad = 0                   # 扫描坏帧用的上一次快照
-        self._trail = deque(maxlen=24)
+        self.stamp_bad = 0                   # 上一次坏帧快照（日志去重用）
+        self._trail = deque(maxlen=24)       # 目标中心轨迹（参考系像素）
         self._t_last_stat = time.time()
         self._last_stat_total = -1
         self._rec = None
         self._rec_path = None
         self._csv_rows = 0
         self._was_stale = None
-        self.standby = False
+        self._port_map = {}
 
-        root.title("智能搬运 · 上位机  |  MaixCAM 相机调试")
+        root.title("智能搬运 · 上位机  |  MaixCAM 相机调试 (v4)")
         root.configure(bg=BG)
         root.geometry("1000x820")
         root.minsize(940, 780)
@@ -497,16 +448,16 @@ class GroundStation:
         head = tk.Frame(left, bg=PANEL, height=28)
         head.pack(side="top", fill="x")
         head.pack_propagate(False)
-        tk.Label(head, text="画面（640×480 归一化还原）", bg=PANEL, fg=FG_DIM,
-                 font=FONT_UI).pack(side="left", padx=10)
+        tk.Label(head, text="画面（固定 640×480 参考系，x/y 是目标中心）",
+                 bg=PANEL, fg=FG_DIM, font=FONT_UI).pack(side="left", padx=10)
         self.lbl_hud = tk.Label(head, text="", bg=PANEL, fg=FG_DIM,
                                 font=FONT_MONO)
         self.lbl_hud.pack(side="right", padx=10)
 
         self.cw, self.ch = 560, 420
         self.canvas = tk.Canvas(left, width=self.cw, height=self.ch,
-                                bg=CANVAS_BG, highlightthickness=0)
-        # 跟着窗口长：画面是归一化坐标，铺满才好看，也不会留下空白
+                                bg=LETTERBOX, highlightthickness=0)
+        # 画布跟着窗口长；里面按 640x480 等比缩放，留黑边而不是拉伸
         self.canvas.pack(side="top", fill="both", expand=True,
                          padx=10, pady=(0, 10))
         self.canvas.bind("<Configure>", self._on_canvas_resize)
@@ -529,121 +480,73 @@ class GroundStation:
         return wrap
 
     def _build_info(self, parent):
-        """状态 + 坐标压成两块紧凑的卡片 —— 右栏必须给控制面板留够高度。"""
-        card = self._card(parent, "状态")
+        """目标信息卡片 —— 字段和 v4 帧一一对应，不多也不少。"""
+        card = self._card(parent, "目标")
 
-        self.v_state = tk.StringVar(value="—")
+        self.v_exists = tk.StringVar(value="—")
         self.v_color = tk.StringVar(value="—")
-        self.v_seq = tk.StringVar(value="—")
+        self.v_shape = tk.StringVar(value="—")
         self.v_fps = tk.StringVar(value="—")
-        self.v_loss = tk.StringVar(value="—")
         self.v_bad = tk.StringVar(value="—")
-        self.v_ack = tk.StringVar(value="—")
+        self.v_center = tk.StringVar(value="—")
+        self.v_size = tk.StringVar(value="—")
+        self.v_delta = tk.StringVar(value="—")
 
         grid = tk.Frame(card, bg=PANEL)
         grid.pack(side="top", fill="x", padx=10, pady=(0, 8))
         grid.columnconfigure(1, weight=1)
         grid.columnconfigure(3, weight=1)
 
-        def cell(r, c, name, var, font):
+        def cell(r, c, name, var, font, width=5):
             tk.Label(grid, text=name, bg=PANEL, fg=FG_DIM, font=FONT_UI,
-                     anchor="w", width=5).grid(row=r, column=c, sticky="w")
+                     anchor="w", width=width).grid(row=r, column=c, sticky="w")
             lbl = tk.Label(grid, textvariable=var, bg=PANEL, fg=FG, font=font,
                            anchor="w")
             lbl.grid(row=r, column=c + 1, sticky="w", padx=(0, 12))
             return lbl
 
-        self.lbl_state = cell(0, 0, "状态", self.v_state, FONT_BIG)
-        self.lbl_state.grid_configure(columnspan=3)
+        self.lbl_exists = cell(0, 0, "目标", self.v_exists, FONT_BIG)
+        self.lbl_exists.grid_configure(columnspan=3)
         self.lbl_color = cell(1, 0, "颜色", self.v_color, FONT_UI_B)
         self.lbl_color.grid_configure(columnspan=3)
-        cell(2, 0, "序号", self.v_seq, FONT_MONO)
-        cell(2, 2, "帧率", self.v_fps, FONT_MONO)
-        cell(3, 0, "丢帧", self.v_loss, FONT_MONO)
+        self.lbl_shape = cell(2, 0, "形状", self.v_shape, FONT_UI_B)
+        self.lbl_shape.grid_configure(columnspan=3)
+        cell(3, 0, "帧率", self.v_fps, FONT_MONO)
         cell(3, 2, "坏帧", self.v_bad, FONT_MONO)
-        cell(4, 0, "回执", self.v_ack, FONT_MONO).grid_configure(columnspan=3)
-
-        # ---- 坐标
-        card2 = self._card(parent, "坐标")
-        self.v_coord = {}
-        grid2 = tk.Frame(card2, bg=PANEL)
-        grid2.pack(side="top", fill="x", padx=10, pady=(0, 6))
-
-        for idx, (short, key) in enumerate((("x", "x_n"), ("y", "y_n"),
-                                            ("w", "w_n"), ("h", "h_n"))):
-            r, c = divmod(idx, 2)
-            cellf = tk.Frame(grid2, bg=PANEL)
-            cellf.grid(row=r, column=c, sticky="w", padx=(0, 26), pady=1)
-            tk.Label(cellf, text=short, bg=PANEL, fg=FG_DIM, font=FONT_MONO,
-                     width=2, anchor="w").pack(side="left")
-            self.v_coord[key] = (tk.StringVar(value="—"),
-                                 tk.StringVar(value="—"))
-            tk.Label(cellf, textvariable=self.v_coord[key][0], bg=PANEL, fg=FG,
-                     font=FONT_MONO, width=4, anchor="e").pack(side="left")
-            tk.Label(cellf, text="→", bg=PANEL, fg="#3d4a5c",
-                     font=FONT_MONO).pack(side="left", padx=2)
-            tk.Label(cellf, textvariable=self.v_coord[key][1], bg=PANEL,
-                     fg=FG_DIM, font=FONT_MONO, width=4, anchor="w").pack(
-                         side="left")
-
-        self.v_delta = tk.StringVar(value="Δ —")
-        tk.Label(grid2, textvariable=self.v_delta, bg=PANEL, fg=C_YELLOW,
-                 font=FONT_MONO, anchor="w").grid(row=2, column=0, columnspan=2,
-                                                  sticky="w", pady=(3, 0))
+        self.lbl_center = cell(4, 0, "中心", self.v_center, FONT_MONO)
+        self.lbl_center.grid_configure(columnspan=3)
+        self.lbl_size = cell(5, 0, "尺寸", self.v_size, FONT_MONO)
+        self.lbl_size.grid_configure(columnspan=3)
+        cell(6, 0, "偏差", self.v_delta, FONT_MONO).grid_configure(columnspan=3)
 
     def _build_controls(self, parent):
         card = self._card(parent, "控制")
 
         row1 = tk.Frame(card, bg=PANEL)
         row1.pack(side="top", fill="x", padx=10)
-        self._btn(row1, "PING", lambda: self.cmd(P.CMD_PING, 0, "PING"),
-                  wide=6).pack(side="left")
-        self._btn(row1, "NEXT", lambda: self.cmd(P.CMD_NEXT, 0, "NEXT"),
-                  wide=6, accent=C_GREEN).pack(side="left", padx=6)
-        self._btn(row1, "ABORT", lambda: self.cmd(P.CMD_ABORT, 0, "ABORT"),
-                  wide=6).pack(side="left")
-
-        row2 = tk.Frame(card, bg=PANEL)
-        row2.pack(side="top", fill="x", padx=10, pady=(6, 0))
-        self.btn_run = self._btn(row2, "RUN", self.toggle_run, wide=6)
-        self.btn_run.pack(side="left")
-        self._btn(row2, "SAVE", lambda: self.cmd(P.CMD_SAVE, 0, "SAVE"),
-                  wide=6).pack(side="left", padx=6)
-        self._btn(row2, "CAL", lambda: self.cmd(P.CMD_CALIBRATE, 0, "CALIBRATE"),
-                  wide=6).pack(side="left")
-
-        row3 = tk.Frame(card, bg=PANEL)
-        row3.pack(side="top", fill="x", padx=10, pady=(6, 0))
-        tk.Label(row3, text="切换颜色", bg=PANEL, fg=FG_DIM,
+        tk.Label(row1, text="选色", bg=PANEL, fg=FG_DIM,
                  font=FONT_UI).pack(side="left")
-        for name, code, cname in (("红", P.COLOR_RED, "red"),
-                                  ("绿", P.COLOR_GREEN, "green"),
-                                  ("蓝", P.COLOR_BLUE, "blue")):
-            b = self._btn(row3, name,
-                          lambda c=code, n=cname: self.cmd(P.CMD_SET_COLOR, c,
-                                                           "SET_COLOR " + n),
+        for name, code, cname in (("红", P.CMD_RED, "red"),
+                                  ("绿", P.CMD_GREEN, "green"),
+                                  ("蓝", P.CMD_BLUE, "blue")):
+            b = self._btn(row1, name,
+                          lambda c=code, n=cname: self.cmd(
+                              c, "TRACK_" + n.upper()),
                           wide=3)
             b.configure(fg=COLOR_HEX[cname])
             b.pack(side="left", padx=(6, 0))
+        self._btn(row1, "PING", lambda: self.cmd(P.CMD_PING, "PING"),
+                  wide=6).pack(side="right")
 
-        row4 = tk.Frame(card, bg=PANEL)
-        row4.pack(side="top", fill="x", padx=10, pady=(6, 0))
-        tk.Label(row4, text="帧率", bg=PANEL, fg=FG_DIM,
-                 font=FONT_UI).pack(side="left")
-        self.fps_var = tk.StringVar(value="14")
-        ttk.Combobox(row4, textvariable=self.fps_var, width=5, state="readonly",
-                     values=("5", "10", "14", "20", "25", "30", "60"),
-                     font=FONT_MONO).pack(side="left", padx=(6, 6))
-        self._btn(row4, "下发", self.send_fps, wide=5).pack(side="left")
-
-        row5 = tk.Frame(card, bg=PANEL)
-        row5.pack(side="top", fill="x", padx=10, pady=(6, 4))
-        self.btn_rec = self._btn(row5, "录制 CSV", self.toggle_record, wide=10)
+        row2 = tk.Frame(card, bg=PANEL)
+        row2.pack(side="top", fill="x", padx=10, pady=(8, 4))
+        self.btn_rec = self._btn(row2, "录制 CSV", self.toggle_record, wide=10)
         self.btn_rec.pack(side="left")
-        self._btn(row5, "清空日志", self.clear_log, wide=9).pack(side="left",
+        self._btn(row2, "清空日志", self.clear_log, wide=9).pack(side="left",
                                                                 padx=6)
 
-        tip = "NEXT / ABORT 平时由主控发，这里手动发是为了联调。"
+        tip = ("v4 下行只有 4 字节：选色 / PING。相机记住最后一次选色，"
+               "一直按这个颜色识别；没有回执，所以日志里只记录本机发出的命令。")
         tk.Label(card, text=tip, bg=PANEL, fg=FG_DIM,
                  font=("Microsoft YaHei UI", 8), wraplength=340,
                  justify="left", anchor="w").pack(
@@ -729,7 +632,7 @@ class GroundStation:
             self.start_link(DemoLink())
             return
         label = self.port_var.get()
-        port = getattr(self, "_port_map", {}).get(label)
+        port = self._port_map.get(label)
         if not port:
             self.log("请先选择一个真实串口（点「刷新」重新扫描）", "err")
             return
@@ -749,8 +652,6 @@ class GroundStation:
                      "err")
             return
         self.stats.reset()
-        self.ack_ok = self.ack_fail = 0
-        self.last_ack = None
         self.stamp_bad = 0
         self._trail.clear()
         self._was_stale = None
@@ -761,9 +662,9 @@ class GroundStation:
             self.port_var.set("(演示模式)")
             self.lbl_conn.configure(text="演示模式", fg=C_YELLOW)
             self.btn_conn.configure(text="断开")
-            self.log("演示模式：数据是程序自己造的，没接任何硬件。", "hint")
-            self.log("界面上的东西都是真的在跑 —— 只是目标不是真相机看的。",
+            self.log("演示模式：数据是程序用 P.build_uplink 造的，没接任何硬件。",
                      "hint")
+            self.log("目标会绕画面移动、换颜色、换环/块，偶尔消失。", "hint")
         else:
             self.lbl_conn.configure(text=getattr(link, "port", "已连接"),
                                     fg=C_GREEN)
@@ -784,7 +685,12 @@ class GroundStation:
         self.stats.reset()
         self._was_stale = None
         self._dirty_canvas = True
-        self.v_fps.set("—")
+        for var in (self.v_exists, self.v_color, self.v_shape, self.v_center,
+                    self.v_size, self.v_delta, self.v_fps, self.v_bad):
+            var.set("—")
+        self.lbl_exists.configure(fg=FG_DIM)
+        self.lbl_color.configure(fg=FG_DIM)
+        self.lbl_shape.configure(fg=FG_DIM)
         self.lbl_fps_top.configure(text="")
         self.lbl_hud.configure(text="")
         self.lbl_led.configure(fg="#4a4f5a")
@@ -803,33 +709,21 @@ class GroundStation:
 
     # ------------------------------------------------------------ 下行命令
 
-    def cmd(self, code, arg, name):
+    def cmd(self, code, name):
+        """发一条 v4 下行（4 字节）。没有回执，发出去就结束。"""
         if self.link is None:
             self.log("还没连接，命令没发出去", "err")
             return
-        frame = P.build_downlink(code, arg)
+        frame = P.build_downlink(code)
         try:
-            self.link.send(frame)
+            ok = self.link.send(frame)
         except Exception as e:                               # noqa: BLE001
             self.log("发送失败：%s" % e, "err")
             return
-        self.log("-> %-14s %s" % (name, hexs(frame)), "tx")
-
-    def send_fps(self):
-        try:
-            v = int(self.fps_var.get())
-        except ValueError:
+        if not ok:
+            self.log("发送失败：链路未就绪", "err")
             return
-        if not 1 <= v <= 60:
-            self.log("帧率只能是 1~60", "err")
-            return
-        self.cmd(P.CMD_SET_FPS, v, "SET_FPS %d" % v)
-
-    def toggle_run(self):
-        self.standby = not self.standby
-        arg = 0 if self.standby else 1
-        self.cmd(P.CMD_RUN_STANDBY, arg, "STANDBY" if self.standby else "RUN")
-        self.btn_run.configure(text="STBY" if self.standby else "RUN")
+        self.log("-> %-11s %s" % (name, hexs(frame)), "tx")
 
     # ------------------------------------------------------------ CSV
 
@@ -849,7 +743,8 @@ class GroundStation:
                             "gs-%s.csv" % time.strftime("%Y%m%d-%H%M%S"))
         try:
             self._rec = open(path, "w", encoding="utf-8-sig", newline="")
-            self._rec.write("t,seq,exists,color,state,x_n,y_n,w_n,h_n,dx,dy\n")
+            # 字段按 v4 帧来：没有序号、没有 state，多了环/块标志和角度
+            self._rec.write("t,exists,color,shape,angle_deg,cx,cy,w,h\n")
         except OSError as e:
             self.log("建不了 CSV：%s" % e, "err")
             self._rec = None
@@ -896,20 +791,17 @@ class GroundStation:
 
         changed = False
         for f in frames:
-            if f["kind"] != "uplink":
-                self._on_ack(f)
-                continue
-
-            # 状态/颜色变了才记日志，否则日志会被 30 帧/秒刷爆
+            # 有无目标 / 颜色 / 环块 变了才记日志，否则日志会被 30 帧/秒刷爆
             if self.stats.on_frame(now, f):
-                sname = P.STATE_NAMES.get(f["state"], "?")
                 if f["exists"]:
-                    self.log("目标 %s · %s" % (sname, f["color_name"]), "rx")
+                    self.log("目标 %s · %s" % (f["color_name"],
+                                              shape_name(f["is_ring"])), "rx")
                 else:
-                    self.log("状态 %s · 画面里没有目标" % sname, "info")
+                    self.log("画面里没有目标（当前追踪色 %s）"
+                             % f["color_name"], "info")
 
             if f["exists"]:
-                self._trail.append((f["x_n"], f["y_n"]))
+                self._trail.append((f["cx"], f["cy"]))
             self.last = f
             changed = True
             self._write_csv(now, f)
@@ -923,7 +815,7 @@ class GroundStation:
             self.stamp_bad = bad
 
         if dropped:
-            self.log("界面卡顿，跳过 %d 帧（统计已计入）" % dropped, "info")
+            self.log("界面卡顿，跳过 %d 帧" % dropped, "info")
 
         if changed and self.last is not None:
             self._dirty_canvas = True
@@ -937,8 +829,8 @@ class GroundStation:
             # 没有新帧就别重复打同一行 —— 断流时日志会被同一组数字刷满
             if s.total and s.total != self._last_stat_total:
                 self._last_stat_total = s.total
-                self.log("统计：累计 %d 帧，无目标 %d，丢帧 %d，重连 %d，坏帧 %d"
-                         % (s.total, s.no_target, s.lost, s.resyncs, bad))
+                self.log("统计：累计 %d 帧，无目标 %d，色环 %d，色块 %d，坏帧 %d"
+                         % (s.total, s.no_target, s.rings, s.blocks, bad))
             self._flush_csv()
 
     # 一次最多处理多少帧 —— 界面跟不上时宁可跳过，也不要雪崩
@@ -959,7 +851,7 @@ class GroundStation:
         self._dirty_canvas = True
         if s.stale:
             if s.last_recv is not None:
-                self.log("断流：%.1f 秒没收到上行帧（相机待机？掉电？线松了？）"
+                self.log("断流：%.1f 秒没收到上行帧（相机掉电？线松了？）"
                          % s.idle, "err")
             self.lbl_led.configure(fg=C_YELLOW)
         elif was is True:
@@ -973,53 +865,58 @@ class GroundStation:
         注意：这里每 tick 调一次（约 25Hz），**不是**每帧调一次 ——
         30 帧/秒时每帧都刷 10 个 Tk 变量纯属浪费，而且只有最后一帧的值留下来。
         """
-        s = self.stats
-        state = f["state"]
         exists = bool(f["exists"])
-        # 没有目标时 color 字段是 0，显示成 "?" 只会让人以为识别出问题了
-        color = f["color_name"] if exists else "—"
-
-        self.v_state.set(P.STATE_NAMES.get(state, "?"))
-        self.lbl_state.configure(fg=STATE_HEX.get(state, FG))
-        self.v_color.set(color)
-        self.lbl_color.configure(fg=COLOR_HEX.get(color, FG_DIM))
-        self.v_seq.set(str(f["seq"]))
-        self.v_loss.set("%d (%.2f%%)" % (s.lost, s.loss_pct))
-        self.v_ack.set(self.last_ack or "—")
+        color = f["color_name"]
 
         if exists:
-            cw, ch = self.cw, self.ch
-            for k, n, p in (("x_n", f["x_n"], round(f["x_n"] / 255.0 * cw)),
-                            ("y_n", f["y_n"], round(f["y_n"] / 255.0 * ch)),
-                            ("w_n", f["w_n"], round(f["w_n"] / 255.0 * cw)),
-                            ("h_n", f["h_n"], round(f["h_n"] / 255.0 * cw))):
-                a, b = self.v_coord[k]
-                a.set(str(n))
-                b.set(str(p))
-            self.v_delta.set("Δx %+d   Δy %+d   （中心 128,128）"
-                             % (f["dx"], f["dy"]))
+            self.v_exists.set("有目标")
+            self.lbl_exists.configure(fg=C_GREEN)
+            self.lbl_color.configure(fg=COLOR_HEX.get(color, FG))
+            self.v_color.set(color)
+            if f["is_ring"]:
+                self.v_shape.set("色环  %.1f°" % f["angle_deg"])
+                self.lbl_shape.configure(fg=SHAPE_RING_HEX)
+            else:
+                self.v_shape.set("色块")
+                self.lbl_shape.configure(fg=SHAPE_BLOCK_HEX)
+            self.v_center.set("(%d, %d) px" % (f["cx"], f["cy"]))
+            self.v_size.set("%d × %d px" % (f["w"], f["h"]))
+            self.v_delta.set("Δx %+d   Δy %+d   （中心 320,240）"
+                             % (f["cx"] - P.REF_W // 2,
+                                f["cy"] - P.REF_H // 2))
+            self.lbl_hud.configure(
+                text="%s · %s · (%d, %d)"
+                % (color, shape_name(f["is_ring"]), f["cx"], f["cy"]))
         else:
             # exists=0 时协议规定坐标字段全为 0。照原样显示会变成
-            # "x 0 → 0，Δx -128" —— 看起来像"目标跑到左上角去了"，纯属误导。
-            for k in ("x_n", "y_n", "w_n", "h_n"):
-                a, b = self.v_coord[k]
-                a.set("—")
-                b.set("—")
+            # "中心 (0,0)，Δx -320" —— 看起来像目标跑到左上角去了，纯属误导。
+            # 颜色字段仍然是有效的（相机记得当前选色），所以保留但压暗。
+            self.v_exists.set("无目标")
+            self.lbl_exists.configure(fg=FG_DIM)
+            self.lbl_color.configure(fg=FG_DIM)
+            self.v_color.set(color)
+            self.v_shape.set("—")
+            self.lbl_shape.configure(fg=FG_DIM)
+            self.v_center.set("—")
+            self.v_size.set("—")
             self.v_delta.set("—   （画面里没有目标）")
-
-        self.lbl_hud.configure(
-            text="seq %d   %s   %s" % (f["seq"], color,
-                                       P.STATE_NAMES.get(state, "?")))
+            self.lbl_hud.configure(text="无目标 · 追踪色 %s" % color)
 
     # ------------------------------------------------------------ CSV
 
     def _write_csv(self, now, f):
         if self._rec is None:
             return
+        # 无目标时 is_ring 没有意义（协议里坐标/形状字段都是 0），
+        # 照实写 none，别让离线复盘把"没目标"误当成"色块"。
+        if not f["exists"]:
+            shape = "none"
+        else:
+            shape = "ring" if f["is_ring"] else "block"
         try:
-            self._rec.write("%.4f,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d\n" % (
-                now, f["seq"], f["exists"], f["color"], f["state"],
-                f["x_n"], f["y_n"], f["w_n"], f["h_n"], f["dx"], f["dy"]))
+            self._rec.write("%.4f,%d,%s,%s,%.1f,%d,%d,%d,%d\n" % (
+                now, f["exists"], f["color_name"], shape,
+                f["angle_deg"], f["cx"], f["cy"], f["w"], f["h"]))
             self._csv_rows += 1
         except OSError as e:
             self.log("写 CSV 失败：%s（已停止录制）" % e, "err")
@@ -1033,34 +930,27 @@ class GroundStation:
         except OSError:
             pass
 
-    def _on_ack(self, d):
-        # 回执帧：cmd 最高位为 1，ack_of 是原命令
-        ok = bool(d.get("demo_ok", d["arg"] == P.STATUS_OK))
-        name = P.CMD_NAMES.get(d["ack_of"], "0x%02X" % d["ack_of"])
-        text = "%s %s" % (name, "OK" if ok else "FAIL")
-        if ok:
-            self.ack_ok += 1
-        else:
-            self.ack_fail += 1
-        # 带上累计计数：否则下一条命令一来就把上一条的结果盖掉了
-        self.last_ack = "%s   [OK %d / FAIL %d]" % (
-            text, self.ack_ok, self.ack_fail)
-        self.v_ack.set(self.last_ack)
-        if ok:
-            self.log("<- 回执 %s" % text, "ok")
-        else:
-            self.log("<- 回执 %s（相机拒绝了这条命令）" % text, "err")
-
     # ------------------------------------------------------------ 绘制
 
     def _on_canvas_resize(self, ev):
-        """画布跟着窗口变 —— 它是归一化坐标的显示区，铺满即可。"""
+        """画布跟着窗口变 —— 640x480 参考系等比缩放到里面。"""
         if ev.width < 80 or ev.height < 80:
             return
         if (ev.width, ev.height) == (self.cw, self.ch):
             return
         self.cw, self.ch = ev.width, ev.height
         self._dirty_canvas = True
+
+    def _view(self):
+        """把固定的 640x480 参考系等比铺到画布中央，返回缩放和偏移。
+
+        为什么不直接按画布宽高拉伸：画布不是 4:3 时目标框会变形，
+        测出来的 w/h 比例就不可信了。留黑边比画错强。
+        """
+        cw, ch = self.cw, self.ch
+        scale = min(cw / float(P.REF_W), ch / float(P.REF_H))
+        vw, vh = P.REF_W * scale, P.REF_H * scale
+        return scale, (cw - vw) / 2.0, (ch - vh) / 2.0, vw, vh
 
     def _draw_idle(self):
         c = self.canvas
@@ -1072,7 +962,7 @@ class GroundStation:
     def _draw_overlay(self):
         """画在最上层的状态条：断流警告。
 
-        为什么要有它：相机待机或掉电时，界面上最后一帧会一直停在那儿，
+        为什么要有它：相机掉电或线松了时，界面上最后一帧会一直停在那儿，
         看起来和"活着"一模一样 —— 现场最容易因此误判成"相机不识别了"。
         """
         if self.link is None:
@@ -1081,99 +971,117 @@ class GroundStation:
         if not s.stale:
             return
         c = self.canvas
-        cw = self.cw
+        scale, ox, oy, vw, vh = self._view()
         if s.last_recv is None:
             text = "等待第一帧…"
         else:
             text = "数据过期  %.1f s" % s.idle
         w = 210
-        x0 = (cw - w) / 2.0
-        c.create_rectangle(x0, 10, x0 + w, 42, fill="#2a2415", outline=C_YELLOW)
-        c.create_text(cw / 2, 26, text=text, fill=C_YELLOW,
+        x0 = ox + vw / 2.0 - w / 2.0
+        c.create_rectangle(x0, oy + 10, x0 + w, oy + 42,
+                           fill="#2a2415", outline=C_YELLOW)
+        c.create_text(ox + vw / 2.0, oy + 26, text=text, fill=C_YELLOW,
                       font=("Consolas", 10, "bold"))
 
     def _redraw(self):
         c = self.canvas
-        cw, ch = self.cw, self.ch
         c.delete("all")
 
-        # 背景网格
-        for i in range(1, 4):
-            x = cw * i / 4.0
-            y = ch * i / 4.0
-            c.create_line(x, 0, x, ch, fill="#151a22")
-            c.create_line(0, y, cw, y, fill="#151a22")
+        scale, ox, oy, vw, vh = self._view()
+        # 有效画面（640x480）之外是黑边，先画出来，让人知道哪块是真的
+        c.create_rectangle(ox, oy, ox + vw, oy + vh, fill=CANVAS_BG,
+                           outline="#232b38")
 
-        # 中心十字
-        cx, cy = cw / 2.0, ch / 2.0
-        c.create_line(cx, 0, cx, ch, fill="#252b36", dash=(4, 6))
-        c.create_line(0, cy, cw, cy, fill="#252b36", dash=(4, 6))
-        c.create_text(cw - 8, ch - 10, text="中心 128,128", fill="#39414f",
-                      font=("Consolas", 8), anchor="e")
+        # 背景网格：按参考系的 1/4 等分，不是按画布像素
+        for i in range(1, 4):
+            x = ox + vw * i / 4.0
+            y = oy + vh * i / 4.0
+            c.create_line(x, oy, x, oy + vh, fill="#151a22")
+            c.create_line(ox, y, ox + vw, y, fill="#151a22")
+
+        # 参考系中心十字（320,240），不是画布中心
+        cx = ox + vw / 2.0
+        cy = oy + vh / 2.0
+        c.create_line(cx, oy, cx, oy + vh, fill="#252b36", dash=(4, 6))
+        c.create_line(ox, cy, ox + vw, cy, fill="#252b36", dash=(4, 6))
+        c.create_text(ox + 6, oy + 6, text="640×480 参考系", fill="#39414f",
+                      font=("Consolas", 8), anchor="nw")
+        c.create_text(ox + vw - 6, oy + vh - 6, text="中心 320,240",
+                      fill="#39414f", font=("Consolas", 8), anchor="se")
 
         f = self.last
         if f is None:
-            c.create_text(cw / 2, ch / 2, text="等待数据…", fill=FG_DIM,
-                          font=FONT_UI)
+            if self.link is None:
+                c.create_text(cx, cy,
+                              text="未连接\n选好串口后点「连接」，或加 --demo 看演示",
+                              fill=FG_DIM, font=FONT_UI, justify="center")
+            else:
+                c.create_text(cx, cy, text="等待数据…", fill=FG_DIM,
+                              font=FONT_UI)
             return
 
-        # 轨迹
+        # 轨迹（存的是参考系像素，画的时候才乘 scale）
         if len(self._trail) > 1:
             pts = []
-            for x_n, y_n in self._trail:
-                pts.extend((x_n / 255.0 * cw, y_n / 255.0 * ch))
+            for tx, ty in self._trail:
+                pts.extend((ox + tx * scale, oy + ty * scale))
             c.create_line(*pts, fill="#2b3a4d", width=1, smooth=True)
 
         if not f["exists"]:
-            # 这里不能写死"搜索中"：状态可能是"完成"，也可能是"对准目标区"时目标丢了
-            c.create_text(cw / 2, ch / 2 - 8, text="画面里没有目标",
-                          fill=FG_DIM, font=("Microsoft YaHei UI", 12))
-            c.create_text(cw / 2, ch / 2 + 18,
-                          text="状态：%s" % P.STATE_NAMES.get(f["state"], "?"),
+            c.create_text(cx, cy - 8, text="画面里没有目标", fill=FG_DIM,
+                          font=("Microsoft YaHei UI", 12))
+            c.create_text(cx, cy + 18,
+                          text="当前追踪色：%s" % f["color_name"],
                           fill="#4a5464", font=FONT_UI)
             return
 
-        x, y, w, h = norm_box(f["x_n"], f["y_n"], f["w_n"], f["h_n"], cw, ch)
+        # v4 的 x/y 是**中心**：左上角要自己减半个宽高
+        bx = ox + (f["cx"] - f["w"] / 2.0) * scale
+        by = oy + (f["cy"] - f["h"] / 2.0) * scale
+        bw = f["w"] * scale
+        bh = f["h"] * scale
         col = COLOR_HEX.get(f["color_name"], FG)
-        state = P.STATE_NAMES.get(f["state"], "?")
 
         # 框
-        c.create_rectangle(x, y, x + w, y + h, outline=col, width=2)
+        c.create_rectangle(bx, by, bx + bw, by + bh, outline=col, width=2)
         # 四角加粗，看得清
-        arm = max(6, min(w, h) * 0.22)
-        for (ax, ay, dx, dy) in ((x, y, 1, 1), (x + w, y, -1, 1),
-                                 (x, y + h, 1, -1), (x + w, y + h, -1, -1)):
+        arm = min(18.0, max(5.0, min(bw, bh) * 0.22))
+        for (ax, ay, dx, dy) in ((bx, by, 1, 1), (bx + bw, by, -1, 1),
+                                 (bx, by + bh, 1, -1),
+                                 (bx + bw, by + bh, -1, -1)):
             c.create_line(ax, ay, ax + arm * dx, ay, fill=col, width=3)
             c.create_line(ax, ay, ax, ay + arm * dy, fill=col, width=3)
 
-        # 中心点
-        pcx = x + w / 2.0
-        pcy = y + h / 2.0
+        # 中心点（就是协议里的 cx,cy）
+        pcx = ox + f["cx"] * scale
+        pcy = oy + f["cy"] * scale
         c.create_oval(pcx - 3, pcy - 3, pcx + 3, pcy + 3, fill=col, outline="")
 
-        # 标签
-        label = "%s · %s" % (f["color_name"].upper(), state)
-        ty = y - 8 if y > 18 else y + h + 8
-        c.create_text(x, ty, text=label, fill=col, anchor="w",
+        # 标签：颜色 + 环/块（环再带角度，块的角度无意义就不显示）
+        label = "%s · %s" % (f["color_name"].upper(), shape_name(f["is_ring"]))
+        if f["is_ring"]:
+            label += " %.0f°" % f["angle_deg"]
+        ty = by - 8 if by > oy + 18 else by + bh + 8
+        c.create_text(bx, ty, text=label, fill=col, anchor="w",
                       font=("Consolas", 10, "bold"))
 
-        # 到中心的偏差箭头
-        if abs(f["dx"]) > 6 or abs(f["dy"]) > 6:
+        # 到画面中心的偏差箭头
+        if abs(f["cx"] - P.REF_W / 2) > 6 or abs(f["cy"] - P.REF_H / 2) > 6:
             c.create_line(pcx, pcy, cx, cy, fill="#3d4a5c", arrow="last",
                           dash=(2, 4))
 
-        # 右上角坐标
-        c.create_text(cw - 8, 10,
-                      text="x %d  y %d  w %d  h %d   Δ %+d %+d"
-                      % (f["x_n"], f["y_n"], f["w_n"], f["h_n"],
-                         f["dx"], f["dy"]),
+        # 右上角原始坐标（都是参考系像素）
+        c.create_text(ox + vw - 8, oy + 10,
+                      text="中心 %d,%d  尺寸 %d×%d   Δ %+d %+d"
+                      % (f["cx"], f["cy"], f["w"], f["h"],
+                         f["cx"] - P.REF_W // 2, f["cy"] - P.REF_H // 2),
                       fill="#5a6678", font=("Consolas", 8), anchor="ne")
 
 
 # ================================================================ 入口
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(description="智能搬运 · 上位机（图形界面）")
+    ap = argparse.ArgumentParser(description="智能搬运 · 上位机（图形界面，v4）")
     ap.add_argument("--port", help="启动即连接的串口，如 COM5")
     ap.add_argument("--baud", type=int, default=115200, help="波特率，默认 115200")
     ap.add_argument("--demo", action="store_true",
@@ -1210,8 +1118,8 @@ def main(argv=None):
     root.option_add("*TCombobox*Listbox.selectBackground", C_BLUE)
     root.option_add("*TCombobox*Listbox.selectForeground", "#0b0d11")
     app = GroundStation(root, args)
-    app.log("上位机已启动。协议 v3.0：上行 %d 字节，下行 %d 字节。"
-            % (P.UP_FRAME_LEN, P.DOWN_FRAME_LEN), "hint")
+    app.log("上位机已启动。协议 v4：上行 %d 字节（640×480 中心坐标），"
+            "下行 %d 字节。" % (P.UP_FRAME_LEN, P.DOWN_FRAME_LEN), "hint")
     try:
         root.mainloop()
     except KeyboardInterrupt:

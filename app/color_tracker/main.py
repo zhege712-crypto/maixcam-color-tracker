@@ -251,29 +251,55 @@ def parse_args(argv):
 
 
 # ============================================================ 协议常量
+#
+# v4：与组内《相机_主控串口通信协议.docx》字节级一致。
+# 和旧版 v3.0 的三处关键差别（改代码前务必看清）：
+#   1. 坐标从"归一化 0-255"改回"像素 uint16 小端"，且 x/y 是**中心点**
+#   2. 上行**没有帧序号**，所以主控/上位机算不了丢帧，只能看每秒帧率
+#   3. 下行只有 4 字节、无校验和、无参数；相机也**不再回执**
 
 UP_HEADER = b"\xAA\xAA\xBB\xBB"
 UP_TAIL = b"\xFF\xFF\xEE\xEE"
-UP_FRAME_LEN = 17
+UP_FRAME_LEN = 20
 
-DOWN_HEADER = b"\xCC\xCC\xDD\xDD"
-DOWN_TAIL = b"\xFF\xFF\xEE\xEE"
-DOWN_FRAME_LEN = 11
+DOWN_HEADER = b"\xAA\xBB"
+DOWN_TAIL = b"\xFF"
+DOWN_FRAME_LEN = 4
 
-CMD_SET_COLOR = 0x01
-CMD_RUN_STANDBY = 0x02
-CMD_SET_FPS = 0x03
-CMD_CALIBRATE = 0x04
-CMD_NEXT = 0x05          # v3.0：主控"已执行完当前动作"，让相机切到下一阶段
-CMD_ABORT = 0x06         # v3.0：主控放弃本次任务，相机回到搜索
-CMD_SAVE = 0x10
-CMD_PING = 0x7F
+# 下行指令：1/2/3 就是颜色号（主控发"识别哪种颜色"，相机一直按这个识别）
+CMD_TRACK = {0x01: "red", 0x02: "green", 0x03: "blue"}
+CMD_PING = 0x7F          # 扩展：调试用，收到立刻回一帧；主控不需要发
 
-# ---- v3.0 任务阶段（上行 state 字段）----
-# 按比赛规则（附件1-智能搬运比赛规则）定义的搬运流程：
+# 第 6 字节：bit7 = 色环标志，低 7 位 = 角度（0..127 映射 0..360 度）。
+# 文档里这个字节是"旋转角度"，但圆柱没有旋转概念（文档自己也是这么说的），
+# 所以把符号位拿来传"环还是块"——照文档写的解析器只会读到一个无意义的
+# 旋转值，不受影响。
+RING_BIT = 0x80
+ANGLE_STEPS = 127
+
+# 坐标参考系：不管内部用多少分辨率识别，送出去的坐标一律换算到 640x480，
+# 这样主控那边的坐标含义永远不变（以后为了提帧率降分辨率也不会打架）。
+REF_W = 640
+REF_H = 480
+
+# 上行帧内偏移
+OFF_EXISTS = 4
+OFF_COLOR = 5
+OFF_ROTATION = 6
+OFF_X = 7
+OFF_Y = 9
+OFF_W = 11
+OFF_H = 13
+OFF_CHECKSUM = 15
+SUM_START = 4
+SUM_END = 15             # 不含：校验覆盖偏移 4..14 共 11 字节
+
+# ---- 任务阶段（**只用于本地**，v4 协议里不传）----
+# 架构决定：搬运流程逻辑放在 STM32，相机只负责"看见并上报"。
+# 这套状态机保留下来是为了本地演示/单测，不再出现在串口帧里。
+# 按比赛规则（附件1-智能搬运比赛规则）定义：
 #   第一批：原料区 3 个圆柱物料 --按任务码顺序--> 粗加工区对应颜色区域
 #   第二批：粗加工区 3 个圆柱物料 --同样顺序--> 暂存区对应颜色区域
-# 相机只报"现在该盯哪个目标、到位没有"，夹爪动作由主控做，做完回 CMD_NEXT。
 STATE_SEARCH = 0     # 搜索中 / 当前没有可用目标
 STATE_MATERIAL = 1   # 正在对准物料（圆柱）
 STATE_GRAB = 2       # 物料已就位，主控可以抓
@@ -319,47 +345,86 @@ STATUS_FAIL = 0x01
 
 
 # ============================================================ 协议实现
+#
+# v4：与组内《相机_主控串口通信协议.docx》字节级一致。
+# 上行 20 字节、下行 4 字节；上行**没有帧序号**，坐标是**像素中心**。
+# 参照实现见 pc/protocol.py，两边必须完全一样（tests/test_protocol.py 会比对）。
 
 def uplink_checksum(payload):
-    """payload = 偏移 4-11 的 8 字节，累加取低 8 位。"""
+    """payload = 偏移 4-14 的 11 字节，逐字节累加取低 8 位。"""
     return sum(payload) & 0xFF
 
 
-def build_uplink(seq, exists, color, state=0, x_n=0, y_n=0, w_n=0, h_n=0):
-    """组一帧上行数据（17 字节）。exists=0 时坐标字段必须全 0。
+def encode_rotation(angle_deg=0.0, is_ring=False):
+    """把"是否色环 + 角度"压进第 6 字节。
 
-    v3.0：原来的 rotation 字段（v2.0 里恒为 0，从未用过）改名为 state，
-    用来告诉主控"现在该做什么"。帧长和校验方式完全没变。
+    文档里这个字节是旋转角度，但圆柱没有旋转概念（文档也这么说），
+    所以把符号位拿来传环/块标志，低 7 位放角度。
+    """
+    a = int(round(float(angle_deg) * ANGLE_STEPS / 360.0))
+    a = 0 if a < 0 else (ANGLE_STEPS if a > ANGLE_STEPS else a)
+    return (RING_BIT if is_ring else 0) | (a & 0x7F)
+
+
+def to_ref(value, src, dst):
+    """把任意分辨率下的像素长度换算到参考系，四舍五入并截断到 0-65535。"""
+    if src <= 0:
+        return 0
+    n = int(round(value * float(dst) / src))
+    return 0 if n < 0 else (65535 if n > 65535 else n)
+
+
+def build_uplink(exists, color, rotation=0, x=0, y=0, w=0, h=0):
+    """组一帧上行数据（20 字节）。exists=0 时坐标字段必须全 0。
+
+    x/y 是**目标中心**的像素坐标，w/h 是长宽，全部按 640x480 参考系。
     """
     payload = bytes([
-        seq & 0xFF,
         exists & 0x01,
         color & 0xFF,
-        state & 0xFF,
-        x_n & 0xFF,
-        y_n & 0xFF,
-        w_n & 0xFF,
-        h_n & 0xFF,
+        rotation & 0xFF,
+        x & 0xFF, (x >> 8) & 0xFF,
+        y & 0xFF, (y >> 8) & 0xFF,
+        w & 0xFF, (w >> 8) & 0xFF,
+        h & 0xFF, (h >> 8) & 0xFF,
     ])
     return UP_HEADER + payload + bytes([uplink_checksum(payload)]) + UP_TAIL
 
 
-def build_ack(cmd, status=STATUS_OK):
-    """组一帧回执（11 字节）。"""
-    ack_cmd = (cmd + 0x80) & 0xFF
-    return DOWN_HEADER + bytes([ack_cmd, status, (ack_cmd + status) & 0xFF]) + DOWN_TAIL
+def build_uplink_for_blob(exists, color, blob, img_w, img_h,
+                          is_ring=False, angle_deg=0.0):
+    """从 MaixPy 风格的 blob（x, y, w, h，左上角像素）直接组帧。
+
+    内部会自动：把左上角换算成中心、把任意分辨率换算到 640x480 参考系。
+    """
+    rot = encode_rotation(angle_deg, is_ring)
+    if not exists or blob is None:
+        return build_uplink(0, color, rot, 0, 0, 0, 0)
+    bx, by, bw, bh = blob[0], blob[1], blob[2], blob[3]
+    cx = to_ref(bx + bw / 2.0, img_w, REF_W)
+    cy = to_ref(by + bh / 2.0, img_h, REF_H)
+    rw = to_ref(bw, img_w, REF_W)
+    rh = to_ref(bh, img_w, REF_W)      # 宽高都用画面宽度归一化，和旧版保持一致
+    return build_uplink(1, color, rot, cx, cy, rw, rh)
+
+
+def build_downlink(cmd):
+    """组一帧下行（4 字节）。主要给测试和上位机用。"""
+    return DOWN_HEADER + bytes([cmd & 0xFF]) + DOWN_TAIL
 
 
 def parse_downlink(frame):
-    """解析一帧下行指令（11 字节），失败返回 None。"""
+    """解析一帧下行指令（4 字节），失败返回 None。"""
     if len(frame) != DOWN_FRAME_LEN:
         return None
-    if frame[0:4] != DOWN_HEADER or frame[7:11] != DOWN_TAIL:
+    if frame[0:2] != DOWN_HEADER or frame[3:4] != DOWN_TAIL:
         return None
-    cmd, arg = frame[4], frame[5]
-    if (cmd + arg) & 0xFF != frame[6]:
-        return None
-    return {"cmd": cmd, "arg": arg}
+    cmd = frame[2]
+    if cmd == CMD_PING:
+        return {"cmd": cmd, "color": None, "cmd_name": "PING"}
+    if cmd in CMD_TRACK:
+        return {"cmd": cmd, "color": CMD_TRACK[cmd], "cmd_name": "TRACK"}
+    return None
 
 
 def norm255(value, total):
@@ -588,25 +653,24 @@ class DownlinkParser:
         return out
 
 
-def frame_from_blob(seq, color_name, blob, img_w, img_h):
-    """把一个色块（blob）换算成归一化字段并组帧。
+def frame_from_blob(color_name, blob, img_w, img_h, is_ring=False):
+    """把一个色块（blob）打包成 v4 上行帧。
 
-    blob 需要支持 blob[0..3] = x, y, w, h（MaixPy find_blobs 的返回格式）。
-    blob 为 None 表示未检测到目标 —— 此时坐标字段全部填 0（绝不是 128）。
+    blob 需要支持 blob[0..3] = x, y, w, h（左上角像素，MaixPy find_blobs 格式）。
+    blob 为 None 表示未检测到目标 —— 此时坐标字段全部填 0。
+
+    返回 (帧, 像素信息字典或 None)。字典里是**原始分析分辨率**下的像素值，
+    帧里是换算到 640x480 参考系之后的值，两者不一样，别混。
     """
     code = COLOR_CODE.get(color_name, 0x00)   # 自动模式尚未判定颜色时上报 0x00
+    rot = encode_rotation(0.0, is_ring)
     if blob is None:
-        return build_uplink(seq, 0, code, 0, 0, 0, 0, 0), None
+        return build_uplink(0, code, rot, 0, 0, 0, 0), None
 
     bx, by, bw, bh = blob[0], blob[1], blob[2], blob[3]
-    cx = bx + bw / 2.0
-    cy = by + bh / 2.0
-    x_n = norm255(cx, img_w)
-    y_n = norm255(cy, img_h)
-    w_n = norm255(bw, img_w)   # 注意：长宽都除以画面宽度，保证面积同尺度
-    h_n = norm255(bh, img_w)
-    frame = build_uplink(seq, 1, code, 0, x_n, y_n, w_n, h_n)
-    info = {"x": bx, "y": by, "w": bw, "h": bh, "x_n": x_n, "y_n": y_n, "w_n": w_n, "h_n": h_n}
+    frame = build_uplink_for_blob(1, code, blob, img_w, img_h, is_ring)
+    info = {"x": bx, "y": by, "w": bw, "h": bh,
+            "cx": bx + bw / 2.0, "cy": by + bh / 2.0, "is_ring": is_ring}
     return frame, info
 
 
@@ -777,14 +841,13 @@ class FieldUI:
     """
 
     BUTTONS = [
-        ("1", 0, 0), ("2", 1, 0), ("3", 2, 0), ("CLR", 3, 0), ("RUN", 4, 0),
-        ("LEARN", 0, 1), ("SAVE", 1, 1), ("G-SZ", 2, 1), ("D-SZ", 3, 1),
-        ("RST", 4, 1),
+        ("1", 0, 0), ("2", 1, 0), ("3", 2, 0), ("CLR", 3, 0),
+        ("RUN", 0, 1), ("LEARN", 1, 1), ("SAVE", 2, 1), ("RST", 3, 1),
     ]
     LABEL = {"CLR": "CLR", "RUN": "RUN", "LEARN": "LEARN",
-             "SAVE": "SAVE", "RST": "RST", "G-SZ": "G-SZ", "D-SZ": "D-SZ"}
+             "SAVE": "SAVE", "RST": "RST"}
 
-    def __init__(self, w=552, h=368, cols=5, rows=2,
+    def __init__(self, w=552, h=368, cols=4, rows=2,
                  gap=4, row_h=46, margin=4):
         self.w, self.h = w, h
         self.code_buf = ""
@@ -945,70 +1008,6 @@ def learn_from_center(img, img_w, img_h, k=2.5, pixels_threshold=400):
     note = "%s L0-100 A%d-%d B%d-%d ch%.0f sz%dx%d" % (
         name_final, th[2], th[3], th[4], th[5], chroma, b[2], b[3])
     return name_final, th, note
-
-
-def measure_center_target(img, img_w, img_h, thresholds=None,
-                          pixels_threshold=200, margin=0.95):
-    """量出画面正中那个目标的归一化宽度 w_n（0~255），给屏幕上的 G-SZ / D-SZ 用。
-
-    为什么需要它：`is_aligned()` 的判据是 `w_n >= grab_w_n`，
-    而 grab_w_n / drop_w_n 以前只能靠电脑写进配置 —— 现场没有电脑就标不了，
-    于是会出现"目标都到画面正中央了，状态还停在『对准物料』永远不会变成
-    『可以抓』"。2026-10-21 现场日志就是这样：目标 w_n=43，占位值 90，
-    条件永远不成立。
-
-    用法：把物料摆到**动作点**（主控该开始抓/放的那个位置），按一下 G-SZ，
-    相机就把此刻目标的宽度记成 grab_w_n。色环同理按 D-SZ。
-
-    设计要点：
-      * 用**当前正在跑的阈值**去找，量到的就是运行时看到的那个尺寸。
-      * 乘 margin=0.95 留 5% 余量：w_n 是 1 像素级的量，正好卡在边界上
-        会抖一下就从"到位"掉回"没到位"。
-      * 长宽都除以画面宽度，和 frame_from_blob() 用的是同一个刻度。
-
-    返回 (w_n, note)；失败时 w_n 为 None，note 是原因（ASCII，屏幕上用）。
-    """
-    if thresholds is None:
-        thresholds = THRESHOLDS
-    cx, cy = img_w / 2.0, img_h / 2.0
-    rx, ry = int(img_w * 0.3), int(img_h * 0.3)
-    roi = [rx, ry, int(img_w * 0.4), int(img_h * 0.4)]
-
-    ranges = []
-    for name in ("red", "green", "blue"):
-        for r in thresholds.get(name) or []:
-            ranges.append(list(r))
-    if not ranges:
-        return None, "NO THRESHOLD"
-
-    try:
-        blobs = img.find_blobs(ranges, pixels_threshold=pixels_threshold,
-                               roi=roi)
-    except Exception:                                         # noqa: BLE001
-        return None, "PROBE FAIL"
-    if not blobs:
-        return None, "NO TARGET AT CENTER"
-
-    best = None
-    for b in blobs:
-        if b[2] < 6 or b[3] < 6:
-            continue
-        bcx, bcy = b[0] + b[2] / 2.0, b[1] + b[3] / 2.0
-        d = ((bcx - cx) ** 2 + (bcy - cy) ** 2) ** 0.5
-        if d > min(img_w, img_h) * 0.30:
-            continue
-        if best is None or d < best[0]:
-            best = (d, b)
-    if best is None:
-        return None, "NO TARGET AT CENTER"
-
-    b = best[1]
-    if b[2] > img_w * 0.95:
-        return None, "TOO WIDE (threshold?)"
-    wn = int(norm255(b[2], img_w) * margin)
-    if wn < 5:
-        return None, "TOO SMALL (move closer)"
-    return wn, "ok"
 
 
 def draw_field_ui(canvas, ui, image, line1, line2, msg, running):
@@ -1351,18 +1350,23 @@ def scan_objects(img, img_w, img_h, pixels_threshold=None,
     return dedup_objects(objs)
 
 
-def frame_from_object(seq, obj, state=0, color=None):
-    """把目标打包成上行帧（v3.0）。obj=None 表示没有目标。
+def frame_from_object(obj, color=None, img_w=REF_W, img_h=REF_H):
+    """把目标打包成 v4 上行帧。obj=None 表示没有目标。
 
-    exists=0 时坐标字段必须全 0（协议硬性要求），但 state 和 color 仍然有效：
-    主控能从这两个字段知道"相机正在等什么"，日志才有意义。
+    obj 里的 cx/cy/w/h 是**分析分辨率下的像素**，这里统一换算到 640x480 参考系；
+    环/块标志走第 6 字节的 bit7（协议扩展，见文件头的说明）。
     """
     if obj is None:
         code = COLOR_CODE.get(color, 0x00) if color else 0x00
-        return build_uplink(seq, 0, code, state, 0, 0, 0, 0), None
+        return build_uplink(0, code, encode_rotation(0.0, False), 0, 0, 0, 0), None
     code = COLOR_CODE.get(obj["color"], 0x00)
-    frame = build_uplink(seq, 1, code, state,
-                         obj["x_n"], obj["y_n"], obj["w_n"], obj["h_n"])
+    ring = bool(obj.get("kind") == "ring")
+    frame = build_uplink(
+        1, code, encode_rotation(0.0, ring),
+        to_ref(obj["cx"], img_w, REF_W),
+        to_ref(obj["cy"], img_h, REF_H),
+        to_ref(obj["w"], img_w, REF_W),
+        to_ref(obj["h"], img_w, REF_W))
     return frame, obj
 
 
@@ -1522,11 +1526,19 @@ def main(argv=None):
             THRESHOLDS[c] = [list(r) for r in ranges]
         print("[INFO] 已用配置文件里的阈值覆盖：%s" % sorted(saved["thresholds"]))
 
-    # ---- v3.0 搬运任务模式 ----
-    if saved.get("mission") or saved.get("ui") or opts["ui"]:
-        opts["mission"] = True
+    # ---- 触摸界面 ----
     if saved.get("ui"):
         opts["ui"] = True
+
+    # ---- 搬运任务状态机（v4 起**默认关闭**）----
+    # 架构决定：搬运流程逻辑放在 STM32，相机只负责"看见并上报"。
+    # 所以这里不再从配置文件里自动打开 mission —— 配置里残留的 "mission": true
+    # 一律忽略，只有命令行显式 --mission 才会启用（本地演示/单测用）。
+    # 否则老配置会让相机跑状态机、上报的又是不带阶段信息的 v4 帧，现场极难排查。
+    if saved.get("mission") and not opts["mission"]:
+        print("[WARN] 配置里的 mission=true 已忽略（v4 由主控负责流程）；"
+              "要本地演示请加 --mission")
+        opts["mission"] = False
     mission = None
     task_code = opts["task_code"] or saved.get("task_code") or CONFIG["task_code"]
 
@@ -1690,23 +1702,10 @@ def main(argv=None):
                 else:
                     say(note)
                     print("[UI] 学习失败：%s" % note)
-            elif name in ("G-SZ", "D-SZ"):
-                wn, note = measure_center_target(img, img_w, img_h)
-                if wn is None:
-                    say(note)
-                    print("[UI] 量尺寸失败：%s" % note)
-                elif mission is None:
-                    say("NO MISSION")
-                elif name == "G-SZ":
-                    mission.grab_w_n = wn
-                    say("GRAB W %d" % wn)
-                    print("[UI] 动作点处物料 w_n = %d" % wn)
-                else:
-                    mission.drop_w_n = wn
-                    say("DROP W %d" % wn)
-                    print("[UI] 动作点处色环 w_n = %d" % wn)
             elif name == "SAVE":
-                extra = {"mission": True, "ui": True,
+                # v4：流程由主控负责，所以 mission 写 false（否则下次开机
+                # 又会打开本地状态机，上报的帧却不带阶段信息，现场很难排查）。
+                extra = {"mission": mission is not None, "ui": True,
                          "thresholds": {c: [list(r) for r in THRESHOLDS[c]]
                                         for c in THRESHOLDS}}
                 if mission is not None:
@@ -1845,8 +1844,8 @@ def main(argv=None):
             objs = scan_objects(img, img_w, img_h)
             dec = mission.update(objs)
             mission_objs, mission_dec = objs, dec
-            frame, info = frame_from_object(seq, dec["target"], dec["state"],
-                                            dec["color"])
+            frame, info = frame_from_object(dec["target"], dec["color"],
+                                            img_w, img_h)
             last_info = info
         else:
             blobs = img.find_blobs(active_threshold,
@@ -1877,103 +1876,48 @@ def main(argv=None):
                 except Exception as e:
                     print("[WARN] LAB 探针失败：%s" % e)
 
-            frame, info = frame_from_blob(seq, color_name, best, img_w, img_h)
+            # v4：要把"环还是块"告诉主控（走第 6 字节的 bit7），
+            # 所以这里对选中的目标做一次形状取样（约 0.5ms，可接受）。
+            is_ring = False
+            if best is not None:
+                rect = (int(best[0]), int(best[1]), int(best[2]), int(best[3]))
+                try:
+                    hole_bg, _ = probe_hole(img, rect)
+                    is_ring = (decide_shape(hole_bg, blob_fill(best, rect))
+                               == "ring")
+                except Exception:                             # noqa: BLE001
+                    is_ring = False
+
+            frame, info = frame_from_blob(color_name, best, img_w, img_h, is_ring)
+            if info is not None:
+                info["ring"] = is_ring
             last_info = info
 
-        # ---------------- 2. 处理主控下行指令 ----------------
+        # ---------------- 2. 处理主控下行指令（v4：4 字节，无参数、无回执）----------------
         data = serial.read() if serial is not None else None
         if data:
             rx_bytes += len(data)
             for cmd in parser.feed(data):
-                c, a = cmd["cmd"], cmd["arg"]
-                # 最高位为 1 的是"回执"，不是命令 —— 必须忽略。
-                # 否则一旦 TX/RX 被短接或对端回环，回执会被当成命令再次回执，
-                # 双方来回 ACK 直接形成风暴。
-                if c & 0x80:
-                    continue
-                ok = True
                 rx_frames += 1
-                if c == CMD_SET_COLOR:
-                    if a in CODE_COLOR:
-                        color_name = CODE_COLOR[a]
-                        print("[CMD] 切换颜色 -> %s" % color_name)
-                    else:
-                        ok = False
-                elif c == CMD_RUN_STANDBY:
-                    if a in (0, 1):
-                        standby = (a == 0)
-                        print("[CMD] %s" % ("待机" if standby else "运行"))
-                    else:
-                        ok = False
-                elif c == CMD_SET_FPS:
-                    if 1 <= a <= 60:
-                        send_fps = a
-                        period_ms = int(1000.0 / send_fps)
-                        print("[CMD] 发送帧率 -> %d" % send_fps)
-                    else:
-                        ok = False
-                elif c == CMD_CALIBRATE:
-                    # 现场重新测色：把物块放到画面中间再发这条命令
-                    if mission is not None:
-                        ok = False      # 搬运模式下没有"单一追踪色"可标定
-                    else:
-                        auto_mode = True
-                        calibrated = False
-                        active_threshold = NONE_THRESHOLD
-                        t_last_cal = 0.0
-                        print("[CMD] 重新自动测色：请把物块放到画面正中间")
-                elif c == CMD_NEXT:
-                    # v3.0：主控抓取/放置完成，让相机推进到下一阶段
-                    if mission is not None:
-                        phase = mission.advance()
-                        where = {"src": "去抓下一个",
-                                 "dst": "去放当前这个"}.get(phase, "两批全部完成")
-                        print("[CMD] 主控完成动作 -> %s | 进度 %s | 本批已完成 %s"
-                              % (where, mission.progress,
-                                 ",".join(sorted(mission.done)) or "无"))
-                    else:
-                        ok = False
-                elif c == CMD_ABORT:
-                    if mission is not None:
-                        mission.abort()
-                        print("[CMD] 主控放弃本次任务，相机回到搜索")
-                    else:
-                        ok = False
-                elif c == CMD_SAVE:
-                    th_now = None
-                    if calibrated and len(active_threshold) == 1:
-                        th_now = active_threshold[0]
-                    extra = None
-                    if mission is not None:
-                        # 把现场标定的两个动作点、门限、任务码一起存下来
-                        extra = {"mission": True,
-                                 "grab_point": list(mission.grab_point),
-                                 "drop_point": list(mission.drop_point),
-                                 "grab_w_n": mission.grab_w_n,
-                                 "drop_w_n": mission.drop_w_n,
-                                 "task_code": task_code}
-                        if mission.hold_point:
-                            extra["hold_point"] = list(mission.hold_point)
-                    ok = save_config(CONFIG["config_path"], color_name, send_fps,
-                                     opts["save_image"], opts["save_every"], opts,
-                                     th_now, extra)
-                    if ok and th_now:
-                        print("[CMD] 已保存：颜色=%s 阈值=%s" % (color_name, th_now))
-                    elif ok and extra:
-                        print("[CMD] 已保存搬运参数：%s" % extra)
-                elif c == CMD_PING:
-                    serial.write(frame)   # 立即回一帧上行数据
-                else:
-                    ok = False
-
-                serial.write(build_ack(c, STATUS_OK if ok else STATUS_FAIL))
-                if not ok:
-                    print("[CMD] 未知或非法命令 cmd=0x%02X arg=0x%02X" % (c, a))
+                if cmd["cmd"] == CMD_PING:
+                    # 扩展指令，调试用：立刻补发一帧，方便上位机确认链路是通的。
+                    # 主控不需要发它。
+                    if serial is not None:
+                        serial.write(frame)
+                        sent_frames += 1
+                    print("[CMD] PING -> 立即补发一帧")
+                elif cmd["color"]:
+                    color_name = cmd["color"]
+                    active_threshold = THRESHOLDS.get(color_name, NONE_THRESHOLD)
+                    auto_mode = False
+                    print("[CMD] 主控指定识别颜色 -> %s（一直按这个识别）" % color_name)
 
         # ---------------- 3. 发送上行帧 ----------------
+        # v4 没有帧序号；文档要求"收到指令后一直识别下去"，所以除了本地
+        # 暂停（触摸屏 RUN 键）之外不做任何发送门控。
         if serial is not None and not standby:
             serial.write(frame)
-            seq = (seq + 1) & 0xFF
+            seq = (seq + 1) & 0xFF        # 只给日志用，协议里已经没有序号了
             sent_frames += 1
 
         # ---------------- 4. 叠加层与显示 ----------------

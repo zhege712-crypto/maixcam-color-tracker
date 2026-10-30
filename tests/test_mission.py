@@ -316,7 +316,7 @@ def test_mission_hold_point():
 def test_field_ui():
     section("现场触摸界面（布局/命中/任务码输入）")
     ui = CAM.FieldUI(552, 368)
-    check(len(ui.rects) == 10, "应有 10 个按钮，得到 %d", len(ui.rects))
+    check(len(ui.rects) == 8, "应有 8 个按钮，得到 %d", len(ui.rects))
 
     for name, (x, y, w, h) in ui.rects.items():
         check(ui.hit(x + w // 2, y + h // 2) == name,
@@ -432,38 +432,42 @@ def test_thresholds_override():
 # ---------------------------------------------------------------- 上行帧
 
 def test_frame_from_object():
-    section("v3.0 上行帧")
-    o = obj("green", 320, 240, 128, kind="ring")
-    frame, info = CAM.frame_from_object(0x2A, o, CAM.STATE_DROP)
-    check(len(frame) == 17, "帧长必须还是 17，得到 %d", len(frame))
-    check(frame[4] == 0x2A and frame[5] == 1, "seq/exists 错误")
-    check(frame[6] == P.COLOR_GREEN, "color 应为绿色")
-    check(frame[7] == CAM.STATE_DROP, "state 字段应等于 STATE_DROP")
-    check(frame[8] == 128 and frame[9] == 128, "坐标应是画面正中")
-    check(frame[12] == sum(frame[4:12]) & 0xFF,
-          "校验和错误（必须只覆盖偏移 4-11）")
+    section('v4 上行帧（相机端 frame_from_object）')
+    o = obj('green', 320, 240, 128, kind='ring')
+    frame, info = CAM.frame_from_object(o, None, W, H)
+    check(len(frame) == 20, '帧长必须是 20，得到 %d', len(frame))
+    check(frame[4] == 1, 'exists 应为 1，得到 %d', frame[4])
+    check(frame[5] == P.COLOR_GREEN, 'color 应为绿色，得到 %d', frame[5])
+    check(frame[6] & 0x80, '色环的第 6 字节 bit7 应置位，得到 0x%02X', frame[6])
+    check(frame[CAM.OFF_X] | (frame[CAM.OFF_X + 1] << 8) == 320,
+          '中心 x 应为 320（uint16 小端）')
+    check(frame[CAM.OFF_Y] | (frame[CAM.OFF_Y + 1] << 8) == 240,
+          '中心 y 应为 240')
+    tw = frame[CAM.OFF_W] | (frame[CAM.OFF_W + 1] << 8)
+    th = frame[CAM.OFF_H] | (frame[CAM.OFF_H + 1] << 8)
+    check(tw == 128 and th == 128, '尺寸应为 128x128，得到 %dx%d', tw, th)
+    check(frame[CAM.OFF_CHECKSUM] == CAM.uplink_checksum(frame[4:15]),
+          '校验和必须覆盖偏移 4-14 共 11 字节')
 
-    frame, info = CAM.frame_from_object(0x2B, None, CAM.STATE_DEST, "red")
-    check(frame[5] == 0, "无目标时 exists 必须为 0")
-    check(frame[8:12] == b"\x00\x00\x00\x00", "无目标时坐标必须全 0（不是 128）")
-    check(frame[7] == CAM.STATE_DEST, "无目标时 state 仍应上报")
-    check(frame[6] == P.COLOR_RED, "无目标时仍可上报正在等的颜色")
-    check(info is None, "无目标时 info 应为 None")
+    frame, info = CAM.frame_from_object(None, 'red', W, H)
+    check(frame[4] == 0, '无目标时 exists 必须为 0')
+    check(frame[7:15] == b'\x00' * 8, '无目标时坐标与尺寸必须全 0（不是 128）')
+    check(frame[5] == P.COLOR_RED, '无目标时仍可上报正在等的颜色')
+    check(info is None, '无目标时 info 应为 None')
 
-
-def test_state_constants_match_pc():
-    section("两端状态常量一致")
-    for name in ("SEARCH", "MATERIAL", "GRAB", "DEST", "DROP", "DONE"):
-        a = getattr(CAM, "STATE_" + name)
-        b = getattr(P, "STATE_" + name)
-        check(a == b, "STATE_%s 两端不一致：相机 %d / 上位机 %d", name, a, b)
-    check(len(CAM.STATE_TEXT) == 6, "相机端状态文字表应覆盖 6 个状态")
-    check(len(P.STATE_NAMES) == 6, "上位机状态文字表应覆盖 6 个状态")
-    check(CAM.STATE_BLOCK == CAM.STATE_MATERIAL, "旧名 STATE_BLOCK 应兼容")
-    check(CAM.STATE_RING == CAM.STATE_DEST, "旧名 STATE_RING 应兼容")
+    o2 = obj('blue', 100, 80, 60, kind='block')
+    f2, _ = CAM.frame_from_object(o2, None, W, H)
+    check(not (f2[6] & 0x80), '物块的第 6 字节 bit7 不应置位')
 
 
-# ---------------------------------------------------------------- 主函数
+def test_state_constants_local_only():
+    section('任务状态常量（仅本地用，v4 协议不传）')
+    check(len(CAM.STATE_TEXT) == 6, '相机端状态文字表应覆盖 6 个状态')
+    check(CAM.STATE_BLOCK == CAM.STATE_MATERIAL, '旧名 STATE_BLOCK 应兼容')
+    check(CAM.STATE_RING == CAM.STATE_DEST, '旧名 STATE_RING 应兼容')
+    check(not hasattr(P, 'STATE_SEARCH'),
+          'v4 上位机不该再有 STATE_* （阶段字段已从协议删除）')
+
 
 def main():
     print("=" * 60)
@@ -487,7 +491,7 @@ def main():
     test_config_persistence()
     test_thresholds_override()
     test_frame_from_object()
-    test_state_constants_match_pc()
+    test_state_constants_local_only()
 
     print("\n" + "=" * 60)
     print("结果：通过 %d 项，失败 %d 项" % (_PASS, _FAIL))
