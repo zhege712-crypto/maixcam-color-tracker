@@ -139,7 +139,7 @@ def parse_args(argv):
             "auto_once": False,
             "mission": False, "grab_point": None, "drop_point": None,
             "grab_w": None, "drop_w": None,
-            "task_code": None, "hold_point": None, "ui": False}
+            "task_code": None, "hold_point": None, "ui": False, "net": 0}
 
     def _point(s):
         try:
@@ -217,6 +217,13 @@ def parse_args(argv):
             continue
         if a == "--no-display":
             opts["no_display"] = True
+        elif a == "--net" and i + 1 < len(argv):
+            try:
+                opts["net"] = max(0, int(argv[i + 1]))
+            except ValueError:
+                pass
+            i += 2
+            continue
         elif a == "--no-uart":
             opts["no_uart"] = True
         elif a == "--test-full":
@@ -1408,6 +1415,9 @@ def load_config(path):
         for k in ("auto_continuous", "mission", "ui"):
             if isinstance(saved.get(k), bool):
                 out[k] = saved[k]
+        # 手机页面端口：写进配置就能开机自启时自动带 --net，不用每次手敲
+        if isinstance(saved.get("net"), int) and 0 < saved["net"] < 65536:
+            out["net"] = saved["net"]
         th = saved.get("threshold")
         if (isinstance(th, list) and len(th) == 6
                 and all(isinstance(x, int) for x in th)):
@@ -1534,6 +1544,8 @@ def main(argv=None):
     # ---- 触摸界面 ----
     if saved.get("ui"):
         opts["ui"] = True
+    if not opts["net"] and saved.get("net"):
+        opts["net"] = saved["net"]
 
     # ---- 搬运任务状态机（v4 起**默认关闭**）----
     # 架构决定：搬运流程逻辑放在 STM32，相机只负责"看见并上报"。
@@ -1746,6 +1758,41 @@ def main(argv=None):
     last_info = None
     mission_objs = []        # 搬运模式：本帧所有目标
     mission_dec = None       # 搬运模式：状态机本帧决策
+    # ---- 手机网页服务（--net PORT）：把每帧识别结果推给手机浏览器 ----
+    # 不占串口、不额外开摄像头，只是把主循环已经算好的结果复制一份出去。
+    net_pending = None
+    if opts["net"]:
+        try:
+            import net_server
+        except Exception:                                    # noqa: BLE001
+            try:
+                # 手机服务脚本可能放在两处：应用目录（打包进 app 时）或 /root（手动部署）
+                sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+                sys.path.insert(0, "/root")
+                import net_server
+            except Exception as e:                           # noqa: BLE001
+                net_server = None
+                print("[WARN] 加载 net_server 失败：%s" % e)
+        if net_server is not None:
+            _cmd_q = []
+
+            def _on_net_cmd(c, _q=_cmd_q):
+                _q.append(c)
+                return True
+
+            page = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "mobile.html")
+            if not os.path.exists(page):
+                page = "/root/mobile.html"
+            try:
+                net_server.start(opts["net"], page, on_cmd=_on_net_cmd, quiet=True)
+                print("[NET] 手机页面已开：http://<相机IP>:%d" % opts["net"])
+            except Exception as e:                           # noqa: BLE001
+                net_server = None
+                print("[WARN] 启动手机服务失败：%s" % e)
+    else:
+        net_server = None
+
     t_start = time.time()
     sent_frames = 0
     loop_frames = 0
@@ -1931,6 +1978,36 @@ def main(argv=None):
             serial.write(frame)
             seq = (seq + 1) & 0xFF        # 只给日志用，协议里已经没有序号了
             sent_frames += 1
+
+        # ---------------- 3.5 手机网页：收指令 / 推帧 ----------------
+        if net_server is not None:
+            while _cmd_q:
+                c = _cmd_q.pop(0)
+                if c in CMD_TRACK:
+                    color_name = CMD_TRACK[c]
+                    active_threshold = THRESHOLDS.get(color_name, NONE_THRESHOLD)
+                    auto_mode = False
+                    print("[NET] 手机选了颜色 -> %s" % color_name)
+                elif c == CMD_PING and serial is not None:
+                    serial.write(frame)
+                    sent_frames += 1
+            try:
+                net_server.set_frame({
+                    "ok": True,
+                    "exists": 1 if (info is not None) else 0,
+                    "color": COLOR_CODE.get(color_name, 0),
+                    "color_name": color_name,
+                    "is_ring": bool(info.get("is_ring")) if info else False,
+                    "angle": 0.0,
+                    "cx": int(info["cx"]) if info else 0,
+                    "cy": int(info["cy"]) if info else 0,
+                    "w": int(info["w"]) if info else 0,
+                    "h": int(info["h"]) if info else 0,
+                    "fps": round(fps_now, 1),
+                    "t": time.time(),
+                })
+            except Exception:
+                pass
 
         # ---------------- 4. 叠加层与显示 ----------------
         # 只要"要显示"或"要存调试图"就把叠加层画上去。
