@@ -115,6 +115,87 @@ def norm_box(x_n, y_n, w_n, h_n, cw, ch):
     return cx - bw / 2.0, cy - bh / 2.0, bw, bh
 
 
+# ================================================================ 帧统计
+
+class FrameStats:
+    """上行帧统计（纯逻辑，不碰界面 —— 可以直接单测）。
+
+    三件很容易做错、而且做错了会误导现场判断的事，集中在这里处理：
+
+    1. **断线不记丢帧。** 拔插 USB 或者相机重启之后，帧序号会跳一大截。
+       按序号差直接累加的话，一次重启会被记成几十上百帧丢失，
+       真正的丢帧（接线松动、波特率不对）就淹没在噪声里了。
+       所以：距上一帧超过 `resync_after` 秒才收到的第一帧算"重新同步"，
+       不计入丢帧，单独记 resyncs。
+    2. **帧率用真时间窗**（最近 1 秒实际收到多少帧），
+       而不是"总帧数 / 总时长" —— 后者在断流后会一直虚高，骗人。
+    3. **断流判定**：超过 `stale_after` 秒没有上行帧就置 stale。
+       界面据此显示"数据过期"，而不是一直画着最后一帧装作还活着。
+    """
+
+    def __init__(self, window=1.0, stale_after=1.0, resync_after=0.8):
+        self.window = window
+        self.stale_after = stale_after
+        self.resync_after = resync_after
+        self.reset()
+
+    def reset(self):
+        self.total = 0
+        self.no_target = 0
+        self.lost = 0            # 真正的丢帧（序号断了，但链路一直通着）
+        self.resyncs = 0         # 断线/重启后的重新同步次数（不计入丢帧）
+        self.fps = 0.0
+        self.idle = 0.0          # 距上一帧多久
+        self.stale = False
+        self.last_recv = None
+        self.prev_seq = None
+        self.last_state = None
+        self.last_color = None
+        self._marks = deque()
+
+    def on_frame(self, now, f):
+        """喂一帧上行数据。返回 True 表示状态或颜色变了（值得记一行日志）。"""
+        if self.last_recv is not None:
+            if now - self.last_recv > self.resync_after:
+                self.resyncs += 1          # 断过线，序号不可比，别算丢帧
+            else:
+                self.lost += P.seq_gap(self.prev_seq, f["seq"])
+        self.prev_seq = f["seq"]
+        self.last_recv = now
+        self.total += 1
+        if not f["exists"]:
+            self.no_target += 1
+
+        self._marks.append(now)
+        while self._marks and now - self._marks[0] > self.window:
+            self._marks.popleft()
+
+        changed = (f["state"] != self.last_state
+                   or f["color_name"] != self.last_color)
+        self.last_state = f["state"]
+        self.last_color = f["color_name"]
+        return changed
+
+    def tick(self, now):
+        """推进时间（每帧都可以调，代价很小）。"""
+        if self.last_recv is None:
+            self.fps = 0.0
+            self.idle = 0.0
+            self.stale = True
+            return
+        while self._marks and now - self._marks[0] > self.window:
+            self._marks.popleft()
+        self.idle = max(0.0, now - self.last_recv)
+        self.stale = self.idle > self.stale_after
+        # 断流时不要在界面上显示一个虚高的帧率
+        self.fps = 0.0 if self.stale else float(len(self._marks)) / self.window
+
+    @property
+    def loss_pct(self):
+        denom = self.total + self.lost
+        return 100.0 * self.lost / denom if denom else 0.0
+
+
 # ================================================================ 数据源
 
 class SerialLink:
@@ -317,22 +398,18 @@ class GroundStation:
 
         # 运行时状态
         self.last = None                     # 最近一帧上行数据
-        self.prev_seq = None
-        self.total = 0
-        self.lost = 0
-        self.no_target = 0
+        self.stats = FrameStats()
         self.ack_ok = 0
         self.ack_fail = 0
         self.last_ack = None
         self.stamp_bad = 0                   # 扫描坏帧用的上一次快照
-        self._fps_marks = deque(maxlen=240)
-        self.fps = 0.0
         self._trail = deque(maxlen=24)
-        self._last_state = None
-        self._last_color = None
         self._t_last_stat = time.time()
+        self._last_stat_total = -1
         self._rec = None
         self._rec_path = None
+        self._csv_rows = 0
+        self._was_stale = None
         self.standby = False
 
         root.title("智能搬运 · 上位机  |  MaixCAM 相机调试")
@@ -607,13 +684,16 @@ class GroundStation:
         # 界面还没建完就被调用（比如启动时扫串口失败），直接忽略
         if not hasattr(self, "log_text"):
             return
+        # 用户往上滚着看历史时不要把他拽回底部 —— 这是最烦人的一种"优化"
+        follow = self.log_text.yview()[1] >= 0.999
         t = time.strftime("%H:%M:%S")
         self.log_text.configure(state="normal")
         self.log_text.insert("end", "%s  %s\n" % (t, text), tag)
         lines = int(self.log_text.index("end-1c").split(".")[0])
         if lines > 600:
             self.log_text.delete("1.0", "%d.0" % (lines - 600))
-        self.log_text.see("end")
+        if follow:
+            self.log_text.see("end")
         self.log_text.configure(state="disabled")
 
     def clear_log(self):
@@ -668,12 +748,13 @@ class GroundStation:
             self.log("打开 %s 失败：%s" % (getattr(link, "port", "数据源"), e),
                      "err")
             return
-        self.prev_seq = None
-        self.total = self.lost = self.no_target = 0
+        self.stats.reset()
         self.ack_ok = self.ack_fail = 0
+        self.last_ack = None
         self.stamp_bad = 0
-        self._fps_marks.clear()
         self._trail.clear()
+        self._was_stale = None
+        self._last_stat_total = -1
         self.last = None
         self.lbl_led.configure(fg=C_GREEN)
         if link.is_demo:
@@ -697,6 +778,15 @@ class GroundStation:
             except Exception:                                # noqa: BLE001
                 pass
             self.link = None
+        # 断开后不要把最后一帧留在画布上 —— 那看起来和"正在接收"一模一样
+        self.last = None
+        self._trail.clear()
+        self.stats.reset()
+        self._was_stale = None
+        self._dirty_canvas = True
+        self.v_fps.set("—")
+        self.lbl_fps_top.configure(text="")
+        self.lbl_hud.configure(text="")
         self.lbl_led.configure(fg="#4a4f5a")
         self.lbl_conn.configure(text="未连接", fg=FG_DIM)
         self.btn_conn.configure(text="连接")
@@ -751,7 +841,8 @@ class GroundStation:
                 pass
             self._rec = None
             self.btn_rec.configure(text="录制 CSV", fg=FG)
-            self.log("已停止录制：%s" % self._rec_path, "ok")
+            self.log("已停止录制：%s（%d 行）" % (self._rec_path, self._csv_rows),
+                     "ok")
             return
         os.makedirs("captures", exist_ok=True)
         path = os.path.join("captures",
@@ -764,6 +855,7 @@ class GroundStation:
             self._rec = None
             return
         self._rec_path = path
+        self._csv_rows = 0
         self.btn_rec.configure(text="停止录制", fg=C_RED)
         self.log("开始录制：%s" % path, "ok")
 
@@ -772,8 +864,12 @@ class GroundStation:
     def _tick(self):
         try:
             self._poll()
+            # 断流时"数据过期 N.Ns"的读数在走，得持续重画
+            if self.link is not None and self.stats.stale:
+                self._dirty_canvas = True
             if self._dirty_canvas:
                 self._redraw()
+                self._draw_overlay()
                 self._dirty_canvas = False
         except Exception as e:                               # noqa: BLE001
             self.log("界面异常：%s" % e, "err")
@@ -785,94 +881,157 @@ class GroundStation:
             self.link.error = None
             self.disconnect()
 
+        now = time.time()
         if self.link is None:
+            self.stats.tick(now)
             return
 
-        now = time.time()
-        for f in self.link.drain():
-            if f["kind"] == "uplink":
-                self._on_uplink(f, now)
-            else:
+        frames = self.link.drain()
+        dropped = 0
+        if len(frames) > self.MAX_DRAIN:
+            # 界面卡住过（拖窗口、最小化恢复），一次涌进来太多帧。
+            # 只处理最后一批，否则会把界面再卡一次。
+            dropped = len(frames) - self.MAX_DRAIN
+            frames = frames[-self.MAX_DRAIN:]
+
+        changed = False
+        for f in frames:
+            if f["kind"] != "uplink":
                 self._on_ack(f)
+                continue
+
+            # 状态/颜色变了才记日志，否则日志会被 30 帧/秒刷爆
+            if self.stats.on_frame(now, f):
+                sname = P.STATE_NAMES.get(f["state"], "?")
+                if f["exists"]:
+                    self.log("目标 %s · %s" % (sname, f["color_name"]), "rx")
+                else:
+                    self.log("状态 %s · 画面里没有目标" % sname, "info")
+
+            if f["exists"]:
+                self._trail.append((f["x_n"], f["y_n"]))
+            self.last = f
+            changed = True
+            self._write_csv(now, f)
+
+        self.stats.tick(now)
 
         bad = self.link.bad_frames
         if bad != self.stamp_bad:
             self.log("坏帧 +%d（校验和/帧尾不对，通常是接线或波特率）"
                      % (bad - self.stamp_bad), "err")
             self.stamp_bad = bad
-        self.v_bad.set(str(bad))
 
-        # 帧率：滑动 1 秒窗口
-        while self._fps_marks and now - self._fps_marks[0] > 1.0:
-            self._fps_marks.popleft()
-        self.fps = float(len(self._fps_marks))
-        self.v_fps.set("%.1f fps" % self.fps)
-        self.lbl_fps_top.configure(
-            text="%.1f fps" % self.fps if self.link else "")
+        if dropped:
+            self.log("界面卡顿，跳过 %d 帧（统计已计入）" % dropped, "info")
+
+        if changed and self.last is not None:
+            self._dirty_canvas = True
+            self._render(self.last)
+
+        self._update_link_status(now, bad)
 
         if now - self._t_last_stat >= 1.0:
             self._t_last_stat = now
-            if self.total:
-                self.log("统计：累计 %d 帧，无目标 %d，丢帧 %d，坏帧 %d"
-                         % (self.total, self.no_target, self.lost, bad))
-            self._dirty_canvas = True
+            s = self.stats
+            # 没有新帧就别重复打同一行 —— 断流时日志会被同一组数字刷满
+            if s.total and s.total != self._last_stat_total:
+                self._last_stat_total = s.total
+                self.log("统计：累计 %d 帧，无目标 %d，丢帧 %d，重连 %d，坏帧 %d"
+                         % (s.total, s.no_target, s.lost, s.resyncs, bad))
+            self._flush_csv()
 
-    def _on_uplink(self, f, now):
-        self.total += 1
-        self._fps_marks.append(now)
-        if not f["exists"]:
-            self.no_target += 1
-        self.lost += P.seq_gap(self.prev_seq, f["seq"])
-        self.prev_seq = f["seq"]
-        self.last = f
+    # 一次最多处理多少帧 —— 界面跟不上时宁可跳过，也不要雪崩
+    MAX_DRAIN = 400
+
+    def _update_link_status(self, now, bad):
+        """帧率 / 坏帧 / 断流指示（每 tick 都跑，所以断流也能被发现）。"""
+        s = self.stats
+        self.v_fps.set("%.1f fps" % s.fps)
+        self.v_bad.set(str(bad))
+        self.lbl_fps_top.configure(text="%.1f fps" % s.fps)
+
+        if s.stale == self._was_stale:
+            return
+        was = self._was_stale
+        self._was_stale = s.stale
+        # 断流状态一翻转就要重画画布（上面盖着"数据过期"）
         self._dirty_canvas = True
+        if s.stale:
+            if s.last_recv is not None:
+                self.log("断流：%.1f 秒没收到上行帧（相机待机？掉电？线松了？）"
+                         % s.idle, "err")
+            self.lbl_led.configure(fg=C_YELLOW)
+        elif was is True:
+            # 只有"确实是断过再恢复"才说恢复接收；刚连上不算
+            self.log("恢复接收", "ok")
+            self.lbl_led.configure(fg=C_GREEN)
 
+    def _render(self, f):
+        """把"最近一帧"刷到右栏。
+
+        注意：这里每 tick 调一次（约 25Hz），**不是**每帧调一次 ——
+        30 帧/秒时每帧都刷 10 个 Tk 变量纯属浪费，而且只有最后一帧的值留下来。
+        """
+        s = self.stats
         state = f["state"]
-        color = f["color_name"]
-        if state != self._last_state or color != self._last_color:
-            self._last_state = state
-            self._last_color = color
-            sname = P.STATE_NAMES.get(state, "?")
-            if f["exists"]:
-                self.log("目标 %s · %s" % (sname, color), "rx")
-            else:
-                self.log("状态 %s · 画面里没有目标" % sname, "info")
+        exists = bool(f["exists"])
+        # 没有目标时 color 字段是 0，显示成 "?" 只会让人以为识别出问题了
+        color = f["color_name"] if exists else "—"
 
-        if f["exists"]:
-            self._trail.append((f["x_n"], f["y_n"], now))
-
-        # ---- 面板
         self.v_state.set(P.STATE_NAMES.get(state, "?"))
         self.lbl_state.configure(fg=STATE_HEX.get(state, FG))
         self.v_color.set(color)
-        self.lbl_color.configure(fg=COLOR_HEX.get(color, FG))
+        self.lbl_color.configure(fg=COLOR_HEX.get(color, FG_DIM))
         self.v_seq.set(str(f["seq"]))
-        self.v_loss.set("%d (%.2f%%)" % (
-            self.lost, 100.0 * self.lost / max(1, self.total + self.lost)))
+        self.v_loss.set("%d (%.2f%%)" % (s.lost, s.loss_pct))
         self.v_ack.set(self.last_ack or "—")
 
-        cw, ch = self.cw, self.ch
-        px = {
-            "x_n": (f["x_n"], round(f["x_n"] / 255.0 * cw)),
-            "y_n": (f["y_n"], round(f["y_n"] / 255.0 * ch)),
-            "w_n": (f["w_n"], round(f["w_n"] / 255.0 * cw)),
-            "h_n": (f["h_n"], round(f["h_n"] / 255.0 * cw)),
-        }
-        for k, (n, p) in px.items():
-            a, b = self.v_coord[k]
-            a.set(str(n))
-            b.set(str(p))
-        self.v_delta.set("Δx %+d   Δy %+d   （中心 128,128）"
-                         % (f["dx"], f["dy"]))
+        if exists:
+            cw, ch = self.cw, self.ch
+            for k, n, p in (("x_n", f["x_n"], round(f["x_n"] / 255.0 * cw)),
+                            ("y_n", f["y_n"], round(f["y_n"] / 255.0 * ch)),
+                            ("w_n", f["w_n"], round(f["w_n"] / 255.0 * cw)),
+                            ("h_n", f["h_n"], round(f["h_n"] / 255.0 * cw))):
+                a, b = self.v_coord[k]
+                a.set(str(n))
+                b.set(str(p))
+            self.v_delta.set("Δx %+d   Δy %+d   （中心 128,128）"
+                             % (f["dx"], f["dy"]))
+        else:
+            # exists=0 时协议规定坐标字段全为 0。照原样显示会变成
+            # "x 0 → 0，Δx -128" —— 看起来像"目标跑到左上角去了"，纯属误导。
+            for k in ("x_n", "y_n", "w_n", "h_n"):
+                a, b = self.v_coord[k]
+                a.set("—")
+                b.set("—")
+            self.v_delta.set("—   （画面里没有目标）")
 
         self.lbl_hud.configure(
             text="seq %d   %s   %s" % (f["seq"], color,
                                        P.STATE_NAMES.get(state, "?")))
 
-        if self._rec is not None:
+    # ------------------------------------------------------------ CSV
+
+    def _write_csv(self, now, f):
+        if self._rec is None:
+            return
+        try:
             self._rec.write("%.4f,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d\n" % (
                 now, f["seq"], f["exists"], f["color"], f["state"],
                 f["x_n"], f["y_n"], f["w_n"], f["h_n"], f["dx"], f["dy"]))
+            self._csv_rows += 1
+        except OSError as e:
+            self.log("写 CSV 失败：%s（已停止录制）" % e, "err")
+            self.toggle_record()
+
+    def _flush_csv(self):
+        if self._rec is None:
+            return
+        try:
+            self._rec.flush()      # 每秒刷一次：程序崩了也不至于一行都没有
+        except OSError:
+            pass
 
     def _on_ack(self, d):
         # 回执帧：cmd 最高位为 1，ack_of 是原命令
@@ -910,6 +1069,29 @@ class GroundStation:
                       text="未连接\n选好串口后点「连接」，或加 --demo 看演示",
                       fill=FG_DIM, font=FONT_UI, justify="center")
 
+    def _draw_overlay(self):
+        """画在最上层的状态条：断流警告。
+
+        为什么要有它：相机待机或掉电时，界面上最后一帧会一直停在那儿，
+        看起来和"活着"一模一样 —— 现场最容易因此误判成"相机不识别了"。
+        """
+        if self.link is None:
+            return
+        s = self.stats
+        if not s.stale:
+            return
+        c = self.canvas
+        cw = self.cw
+        if s.last_recv is None:
+            text = "等待第一帧…"
+        else:
+            text = "数据过期  %.1f s" % s.idle
+        w = 210
+        x0 = (cw - w) / 2.0
+        c.create_rectangle(x0, 10, x0 + w, 42, fill="#2a2415", outline=C_YELLOW)
+        c.create_text(cw / 2, 26, text=text, fill=C_YELLOW,
+                      font=("Consolas", 10, "bold"))
+
     def _redraw(self):
         c = self.canvas
         cw, ch = self.cw, self.ch
@@ -938,16 +1120,16 @@ class GroundStation:
         # 轨迹
         if len(self._trail) > 1:
             pts = []
-            for x_n, y_n, _ in self._trail:
+            for x_n, y_n in self._trail:
                 pts.extend((x_n / 255.0 * cw, y_n / 255.0 * ch))
             c.create_line(*pts, fill="#2b3a4d", width=1, smooth=True)
 
         if not f["exists"]:
-            c.create_text(cw / 2, ch / 2, text="无目标 · 搜索中",
+            # 这里不能写死"搜索中"：状态可能是"完成"，也可能是"对准目标区"时目标丢了
+            c.create_text(cw / 2, ch / 2 - 8, text="画面里没有目标",
                           fill=FG_DIM, font=("Microsoft YaHei UI", 12))
-            c.create_text(cw / 2, ch / 2 + 24,
-                          text="%s   %s"
-                          % (P.STATE_NAMES.get(f["state"], "?"), f["color_name"]),
+            c.create_text(cw / 2, ch / 2 + 18,
+                          text="状态：%s" % P.STATE_NAMES.get(f["state"], "?"),
                           fill="#4a5464", font=FONT_UI)
             return
 

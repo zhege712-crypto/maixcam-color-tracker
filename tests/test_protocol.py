@@ -792,6 +792,62 @@ def test_ground_station():
           "搬运模式下 CALIBRATE 应回 FAIL（与相机端行为一致）")
 
 
+def _up(seq, state=0, color=None, exists=1, x=128, y=128, w=50, h=50):
+    """造一帧上行数据并解析回来（和真机上收到的东西同构）。"""
+    color = P.COLOR_RED if color is None else color
+    raw = P.build_uplink(seq, exists, color, state, x, y, w, h)
+    return P.parse_uplink(raw)
+
+
+def test_frame_stats():
+    section("上位机：帧统计（丢帧 / 断线重同步 / 帧率 / 断流）")
+    GS = load_module("ground_station", os.path.join("pc", "ground_station.py"))
+
+    st = GS.FrameStats()
+    check(st.on_frame(0.00, _up(0)), "第一帧状态从无到有，应算变化")
+    check(not st.on_frame(0.02, _up(1)), "状态没变不该报变化")
+    st.on_frame(0.04, _up(3))              # 序号 1 -> 3，中间少了 1 帧
+    check(st.lost == 1, "序号断口应记 1 帧丢失，得到 %d", st.lost)
+    check(st.on_frame(0.06, _up(4, state=P.STATE_GRAB)),
+          "状态变了应返回 True")
+    st.on_frame(0.08, _up(5, exists=0, color=0))
+    check(st.no_target == 1, "无目标帧计数错误")
+    check(st.total == 5, "总帧数应为 5，得到 %d", st.total)
+
+    # 断线之后的第一帧不该被记成"丢失几十帧"
+    lost_before, res_before = st.lost, st.resyncs
+    st.on_frame(5.00, _up(120))            # 4.94 秒没收到帧
+    check(st.resyncs == res_before + 1, "断线后的第一帧应记一次重新同步")
+    check(st.lost == lost_before,
+          "断线后的第一帧不该记丢帧（否则真实丢帧会被淹没），得到 %d vs %d",
+          st.lost, lost_before)
+    # 恢复之后又连续的帧，照常按序号算
+    st.on_frame(5.02, _up(123))
+    check(st.lost == lost_before + 2, "恢复后应继续按序号算丢帧，得到 %d",
+          st.lost)
+
+    # 帧率：1 秒窗口内收 20 帧 -> 20fps
+    st2 = GS.FrameStats(window=1.0, stale_after=1.0)
+    for i in range(20):
+        st2.on_frame(i * 0.02, _up(i))
+    st2.tick(0.39)
+    check(abs(st2.fps - 20.0) < 0.01, "1 秒 20 帧应算 20fps，得到 %.2f", st2.fps)
+    check(not st2.stale, "刚收到帧不该判断流")
+
+    # 断流：不再来帧，界面不能继续显示虚高的帧率
+    st2.tick(1.60)
+    check(st2.stale, "1.2 秒没收到帧应判断流")
+    check(st2.fps == 0.0, "断流时帧率必须归零，得到 %.2f", st2.fps)
+    check(st2.idle > 1.0, "断流时长计算错误，得到 %.2f", st2.idle)
+
+    # 丢帧率：按"应有帧数"算分母
+    st3 = GS.FrameStats()
+    st3.on_frame(0.0, _up(0))
+    st3.on_frame(0.02, _up(3))             # 丢 2
+    check(abs(st3.loss_pct - 100.0 * 2 / 4) < 0.01,
+          "丢帧率应为 2/4=50%%，得到 %.2f", st3.loss_pct)
+
+
 def main():
     print("=" * 64)
     print("协议跨实现一致性测试（基准：协议定稿文档的示例帧）")
@@ -814,6 +870,7 @@ def main():
     test_sim_frames()
     test_mixed_parser()
     test_ground_station()
+    test_frame_stats()
 
     print("\n" + "=" * 64)
     print("结果：通过 %d 项，失败 %d 项" % (_PASS, _FAIL))
