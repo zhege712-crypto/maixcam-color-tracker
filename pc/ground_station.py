@@ -234,6 +234,10 @@ class SerialLink:
         self._ser = None
         self._thread = None
         self.error = None
+        # 原始字节环形缓冲：线上到底来了什么，原样留着。
+        # 波特率不对时这里就是一堆乱码，正好用来定位问题。
+        self._raw = bytearray()
+        self._raw_lock = threading.Lock()
 
     def open(self):
         if not HAVE_SERIAL:
@@ -259,6 +263,10 @@ class SerialLink:
                 self._alive = False
                 break
             if data:
+                with self._raw_lock:
+                    self._raw.extend(data)
+                    if len(self._raw) > 256:
+                        del self._raw[: len(self._raw) - 256]
                 # 解析只在这个线程里做，不需要加锁
                 for f in self.parser.feed(data):
                     self._q.put(f)
@@ -280,6 +288,11 @@ class SerialLink:
             return False
         self._ser.write(data)
         return True
+
+    def raw_snapshot(self):
+        """最近收到的原始字节（最多 256 个），给「原始帧」视图用。"""
+        with self._raw_lock:
+            return bytes(self._raw)
 
     def drain(self):
         out = []
@@ -370,6 +383,9 @@ class DemoLink:
             self._next = now
         return out
 
+    def raw_snapshot(self):
+        return b""
+
     @property
     def bad_frames(self):
         return 0
@@ -397,6 +413,9 @@ class GroundStation:
         self._rec_path = None
         self._csv_rows = 0
         self._was_stale = None
+        self.baud = int(getattr(args, "baud", 115200) or 115200)
+        self.raw_mode = False
+        self._raw_t = 0.0
         self._ports = []
         self._port_idx = 0
         self._hover = None
@@ -448,7 +467,7 @@ class GroundStation:
         if args.demo:
             self.start_link(DemoLink())
         elif args.port:
-            self.connect(args.port, args.baud)
+            self.connect(args.port, self.baud)
 
     # ------------------------------------------------------------ 日志
 
@@ -475,7 +494,8 @@ class GroundStation:
         self.log_text.pack(side="left", fill="both", expand=True)
         for tag, col in (("info", ON_SURFACE_DIM), ("tx", C_YELLOW),
                          ("ok", C_GREEN), ("err", C_RED), ("rx", C_CYAN),
-                         ("hint", SECONDARY)):
+                         ("hint", SECONDARY), ("raw", C_GREEN),
+                         ("rawtail", "#6E6A75")):
             self.log_text.tag_configure(tag, foreground=col)
         self.log_text.configure(state="disabled")
 
@@ -540,7 +560,7 @@ class GroundStation:
             self.log("没有可用串口（点一下串口名旁边的 ↻ 重新扫描）", "err")
             self._refresh_ports()
             return
-        self.connect(port, int(self.args.baud))
+        self.connect(port, self.baud)
 
     def connect(self, port, baud):
         self.start_link(SerialLink(port, baud))
@@ -561,7 +581,7 @@ class GroundStation:
         if link.is_demo:
             self.log("演示模式：数据是程序自己造的，没接任何硬件。", "hint")
         else:
-            self.log("已连接 %s @ %s 8N1" % (getattr(link, "port", "?"), self.args.baud), "ok")
+            self.log("已连接 %s @ %d 8N1" % (getattr(link, "port", "?"), self.baud), "ok")
             self.log("一直没数据的话：查 A19 是否接到 RX、GND 是否共地、波特率 115200。", "hint")
         self._dirty = True
 
@@ -605,6 +625,29 @@ class GroundStation:
             self.log("发送失败：%s" % e, "err")
             return
         self.log("-> %s  %s" % (name, hexs(frame)), "tx")
+
+    def _ask_baud(self):
+        """弹窗输入任意波特率；正连着就按新速率重连。"""
+        from tkinter import simpledialog
+        try:
+            v = simpledialog.askinteger(
+                "设置波特率",
+                "输入波特率（常用 115200 / 921600 / 9600，范围 300~4000000）",
+                initialvalue=self.baud, minvalue=300, maxvalue=4000000,
+                parent=self.root)
+        except Exception:                                    # noqa: BLE001
+            return
+        if not v or int(v) == self.baud:
+            return
+        self.baud = int(v)
+        if self.link is not None and not getattr(self.link, "is_demo", False):
+            port = getattr(self.link, "port", None)
+            self.disconnect()
+            if port:
+                self.connect(port, self.baud)
+            self.log("波特率 -> %d，已按新速率重连" % self.baud, "ok")
+        else:
+            self.log("波特率 -> %d（下次连接生效）" % self.baud)
 
     def toggle_record(self):
         if self._rec:
@@ -658,6 +701,17 @@ class GroundStation:
                     self._trail.append((f["cx"], f["cy"]))
                 self._write_csv(now, f)
                 self._dirty = True
+                if self.raw_mode:
+                    raw = f.get("raw") or b""
+                    self.log("帧 %3d B  %s" % (len(raw), hexs(raw)), "raw")
+            if self.raw_mode and self.link is not None and now - self._raw_t > 0.5:
+                # 每 0.5 秒把「线上原始字节」也吐一次：坏帧、噪声、波特率不对
+                # 造成的乱码都在这里，而不是被解析器丢掉。
+                self._raw_t = now
+                tail = self.link.raw_snapshot()
+                if tail:
+                    self.log("原始 %3d B  ...%s" % (len(tail), hexs(tail[-32:])),
+                             "rawtail")
 
             bad = self.link.bad_frames
             if bad and not getattr(self, "_bad_logged", False):
@@ -678,7 +732,7 @@ class GroundStation:
         if now - self._t_last_stat >= 1.0:
             self._t_last_stat = now
             s = self.stats
-            if s.total != self._last_stat_total:
+            if not self.raw_mode and s.total != self._last_stat_total:
                 self._last_stat_total = s.total
                 self.log("累计 %d 帧｜无目标 %d｜环 %d｜块 %d｜%.1f fps"
                          % (s.total, s.no_target, s.rings, s.blocks, s.fps))
@@ -774,6 +828,14 @@ class GroundStation:
             self.toggle_record()
         elif act == "clear":
             self.clear_log()
+        elif act == "raw":
+            self.raw_mode = not self.raw_mode
+            if self.raw_mode:
+                self.log("--- 原始帧模式：只显示收到的字节，不刷统计 ---", "hint")
+            else:
+                self.log("--- 回到日志模式 ---", "hint")
+        elif act == "baud":
+            self._ask_baud()
 
     # ------------------------------------------------------------ 绘制
 
@@ -1047,19 +1109,25 @@ class GroundStation:
         ph = K(42) * f
         port_txt = ("演示数据源" if getattr(self.link, "is_demo", False)
                     else (self._cur_port or "无串口")) + " ▾"
-        pw = w - pad * 2 - K(96) * f - K(10)
+        baud_w = K(104) * f
+        conn_w = K(84) * f
+        pw = w - pad * 2 - baud_w - conn_w - K(10) * 2
         self._draw_tonal(x + pad, by, pw, ph, port_txt, "port", align="w",
                          font_size=14 * f)
-        self._draw_filled(x + pad + pw + K(10), by, K(96) * f, ph,
+        self._draw_tonal(x + pad + pw + K(10), by, baud_w, ph, str(self.baud),
+                         "baud", font_size=13 * f)
+        self._draw_filled(x + pad + pw + baud_w + K(20), by, conn_w, ph,
                           "断开" if self.link else "连接", "connect",
-                          font_size=16 * f)
+                          font_size=15 * f)
         by += ph + gapv * 0.83
 
-        self._draw_tonal(x + pad, by, (w - pad * 2 - K(10)) / 2.0, K(38) * f,
-                         "重新扫描", "rescan", font_size=13 * f)
-        self._draw_tonal(x + pad + (w - pad * 2 - K(10)) / 2.0 + K(10), by,
-                         (w - pad * 2 - K(10)) / 2.0, K(38) * f, "清空日志",
-                         "clear", font_size=13 * f)
+        bw3 = (w - pad * 2 - K(10) * 2) / 3.0
+        self._draw_tonal(x + pad, by, bw3, K(38) * f, "重扫", "rescan",
+                         font_size=12 * f)
+        self._draw_tonal(x + pad + bw3 + K(10), by, bw3, K(38) * f, "原始帧",
+                         "raw", active=self.raw_mode, font_size=12 * f)
+        self._draw_tonal(x + pad + (bw3 + K(10)) * 2, by, bw3, K(38) * f,
+                         "清空", "clear", font_size=12 * f)
 
     def _draw_tonal(self, x, y, w, h, text, act, active=False, align="c", font_size=15):
         K, cv = self.m, self.cv
