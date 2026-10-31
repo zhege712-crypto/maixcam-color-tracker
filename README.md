@@ -41,7 +41,13 @@ E:\maxican\
 │   ├─ field_test.ps1                   **现场一键工具**（部署/运行/拉图/改配置/重启）
 │   ├─ mobile\index.html                **手机端页面**（浏览器打开，不用装 App）
 │   ├─ watch_ports.py                   盯串口插拔并自检能否写入
+│   ├─ build_release.ps1                打包脚本：生成 release\智能搬运上位机\ 便携版
+│   ├─ 打包上位机.bat                   ↑ 双击跑（省得记 powershell 命令）
+│   ├─ release_tpl\                     便携版的启动器 bat / 使用说明模板（改文案改这里）
 │   └─ make_ring_test.py                生成环/块标准色图（给 vision_selftest 用）
+├─ release\
+│   ├─ 智能搬运上位机\                  **便携版：整包拷到别的电脑，双击 bat 就跑**
+│   └─ 智能搬运上位机.zip               同上，压缩包（发给别人用）
 ├─ stm32\
 │   ├─ mx_protocol.h                    主控侧协议接口（纯 C，不依赖 HAL）
 │   ├─ mx_protocol.c                    主控侧协议实现（流式解析 + 组帧）
@@ -264,6 +270,11 @@ python pc\ground_station.py --demo          # 演示模式：不接任何硬件
   不显示丢帧率；坏帧是校验和/帧尾不对的次数，一涨就是接线或波特率的问题。
 - **录制 CSV** 存到 `captures\gs-时间.csv`，离线复盘用（Excel 直接打开）。
 - 画面区会跟着窗口缩放，但**始终按 640×480 等比映射**，不会把坐标拉变形。
+- **串口和波特率在同一行**：点串口名选 COM 口，点中间的波特率按钮能填**任意值**
+  （300 ~ 4 000 000）；正在连着时改波特率会断开并按新速率重连。
+- **原始帧**开关（底部一行）：打开后日志只打收到的十六进制字节，每 0.5 秒再补一行
+  "线上原始字节"。解析器会把坏帧和噪声全丢掉，正常日志里根本看不到它们——排查
+  "波特率不对 / 线有干扰"时，这一行才是证据（只有乱码、没有 20 字节帧 = 波特率不对）。
 
 `--demo` 模式自己造目标：在 640×480 画面里移动、换颜色、换环/块、偶尔消失，
 没有相机也能把界面和链路演示跑通，给老师演示很方便（它不模拟 STM32 的搬运流程）。
@@ -317,11 +328,11 @@ python pc\serial_monitor.py --simulate --duration 5
 
 相机端跑一个 100 行的 HTTP 小服务（camera/net_server.py，纯标准库）：
 
-`sh
+```sh
 # 相机上：开手机页面（端口 8000）
 python3 /root/maixcam_color_tracker.py --net 8000
 # 或者写进配置，开机自启就带：配置里加 net: 8000
-`
+```
 
 手机和相机在同一网络时，浏览器打开 http://<相机IP>:8000。
 
@@ -329,11 +340,11 @@ python3 /root/maixcam_color_tracker.py --net 8000
 
 **A. 相机自己发热点（推荐，现场不需要路由器）**
 
-`sh
+```sh
 sh /root/wifi_ap.sh start        # 手机连 MaixCAM / maixcam888
 sh /root/wifi_ap.sh status       # 看状态、看连了几台设备
 sh /root/wifi_ap.sh stop         # 关掉，恢复 WiFi 客户端模式
-`
+```
 
 手机连上 MaixCAM（密码 maixcam888）后打开 **http://192.168.4.1:8000**。
 
@@ -344,8 +355,7 @@ sh /root/wifi_ap.sh stop         # 关掉，恢复 WiFi 客户端模式
 **B. 手机开热点，相机连过去**
 
 手机开热点 → 相机连上后拿到 IP → 手机浏览器打开 http://<相机IP>:8000。
-相机连 WiFi 可以用 MaixPy 的 
-etwork 模块，或 wpa_cli。
+相机连 WiFi 可以用 MaixPy 的 `network` 模块（`maix.network.wifi`），或 wpa_cli。
 
 ### 页面能做什么
 
@@ -357,6 +367,46 @@ etwork 模块，或 wpa_cli。
 | 底部 | 红/绿/蓝大按钮（发选色指令）、PING、录制 |
 
 ![手机端](doc/手机上位机.png)
+
+### 4.4 便携版（一个文件夹 + 一个 bat，拷到别的电脑双击就跑）
+
+仓库里已经打好一份：`release\智能搬运上位机\`（同目录还有 `.zip`，发给别人更方便）。
+
+```
+智能搬运上位机\
+├─ 启动上位机.bat        ← 双击这个，别的都不用管
+├─ 使用说明.txt          给现场同学看的：怎么连、怎么排错
+└─ app\
+    ├─ ground_station.py
+    ├─ protocol.py
+    └─ serial\           pyserial 3.5 随包携带，目标机不用 pip install
+```
+
+目标电脑**只要有 Python 3.8+（带 tkinter，官方安装包都带）**就能跑，
+**不用联网、不用装任何包**。启动器按顺序找解释器：
+
+| 顺序 | 找什么 | 为了兜住 |
+| --- | --- | --- |
+| 1 | `py -3` | python.org 官方安装包自带，最靠谱 |
+| 2 | `PATH` 里的 `python` | 优先非 Microsoft Store 版，商店版兜底 |
+| 3 | `%LOCALAPPDATA%\Programs\Python\Python3*`、`%ProgramFiles%\Python\Python3*`、`C:\Python3*` | 装了但**没勾 Add to PATH**（最常见） |
+| 4 | 都没有 | 打印下载地址 + 要勾选的选项，窗口停住不会一闪而过 |
+
+找到之后再依次检查版本 ≥3.8、`tkinter` 能导入、包内文件完整，最后才拉起界面。
+界面关掉，黑窗口自动关；程序异常退出（返回码非 0）时窗口会停住，方便截图报错。
+
+| 想做的事 | 怎么做 |
+| --- | --- |
+| 启动即连串口 | `启动上位机.bat --port COM5` |
+| 演示、不接硬件 | `启动上位机.bat --demo` |
+| 改了代码重新打包 | 双击 `pc\打包上位机.bat`（内部跑 `pc\build_release.ps1`） |
+
+打包脚本做的四件事：拷 `ground_station.py` / `protocol.py` → 把本机 site-packages 里的
+pyserial **.py 源码**搬进 `app\serial\`（纯 Python，无编译产物）→ 由 `pc\release_tpl\`
+生成启动器 bat（**转 GBK + CRLF**，否则 cmd 里中文全乱码）和说明（UTF-8 BOM）→
+语法自检 + 验证"包内 serial 能导入" + 打 zip。
+
+> `release\` 里是**生成物**，别手改；要改文案/流程改 `pc\release_tpl\` 再重新打包。
 
 ## 5. 接入 STM32
 
